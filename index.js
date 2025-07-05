@@ -1,15 +1,13 @@
 // index.js
-require("dotenv").config();
-const { google } = require("googleapis");
-const { OpenAI } = require("openai");
-const stringSimilarity = require("string-similarity");
+import "dotenv/config";
+import { google } from "googleapis";
+import { OpenAI } from "openai";
+import stringSimilarity from "string-similarity";
 
 // —————— 1) 환경 변수 & 상수 ——————
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const CRED_PATH = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-const MAIN_TAB = "Sheet1"; // 기본 시트명으로 변경
 const TELECOMS = ["SK", "KT", "LG"];
-const CHANNELS = ["온라인", "내방"];
 const TYPES = ["번호이동", "기기변경"];
 
 // —————— 2) 클라이언트 초기화 ——————
@@ -208,7 +206,10 @@ function analyzeQuestion(question) {
 
     // 시나리오 분류
     const scenarios = {
-        COMPARISON: /(\w+)랑|어디가|뭐가|더|비교|vs|대|차이/.test(q),
+        COMPARISON:
+            /(\w+)랑|어디가|뭐가|더|비교|vs|대|차이|싼가요|저렴한가요|이득|낫|좋|나은/.test(
+                q
+            ),
         MODEL_ONLY: checkModelOnly(q),
         MODEL_CAPACITY: checkModelCapacity(q),
         MODEL_CAPACITY_TELECOM: checkModelCapacityTelecom(q),
@@ -360,7 +361,7 @@ async function generateResponse(analysis, records, commonServiceInfo) {
         case "FULL_CONDITION":
             return handleFullCondition(extracted, records, commonServiceInfo);
         case "COMPARISON":
-            return handleComparisonWithGPT(originalQuestion, records);
+            return handleComparison(originalQuestion);
         case "INFORMAL":
             return handleInformalWithGPT(
                 originalQuestion,
@@ -509,6 +510,16 @@ function handleComparison(question) {
 }
 
 async function handleInformalWithGPT(question, records, commonServiceInfo) {
+    // 비교 키워드가 있으면 바로 비교 템플릿 반환
+    const q = question.toLowerCase();
+    if (
+        /싼가요|저렴한가요|이득|낫|좋|나은|어디가|뭐가|더|비교|vs|대|차이/.test(
+            q
+        )
+    ) {
+        return handleComparison(question);
+    }
+
     const gptResult = await processWithGPT(question, "INFORMAL");
 
     if (!gptResult) {
@@ -529,6 +540,11 @@ async function handleInformalWithGPT(question, records, commonServiceInfo) {
         telecom: gptResult.통신사 || gptResult.telecom,
         type: gptResult.타입 || gptResult.type,
     };
+
+    // 모델명이 undefined이거나 null인 경우 비교 템플릿 반환
+    if (!normalizedExtracted.brand || normalizedExtracted.model === undefined) {
+        return handleComparison(question);
+    }
 
     // 정규화된 결과로 다시 시나리오 분류
     const hasModel = normalizedExtracted.brand;
@@ -565,61 +581,10 @@ async function handleInformalWithGPT(question, records, commonServiceInfo) {
     }
 }
 
-async function handleComparisonWithGPT(question, records) {
-    const gptResult = await processWithGPT(question, "COMPARISON");
-
-    if (!gptResult) {
-        return handleComparison(question);
-    }
-
-    // 추출된 정보로 부분적 결과 제공 시도
-    const extractedInfo = {
-        brand: gptResult.추출된_브랜드 || gptResult.brand,
-        model: gptResult.추출된_모델 || gptResult.model,
-        capacity: gptResult.추출된_용량 || gptResult.capacity,
-        telecom: gptResult.추출된_통신사 || gptResult.telecom,
-        type: null,
-    };
-
-    const missingInfo = gptResult.누락된_정보 || gptResult.missing_info || [];
-    const comparisonTarget = gptResult.비교대상 || gptResult.comparison_target;
-
-    let response = `💭 GPT 분석: ${comparisonTarget}에 대한 비교를 원하시는군요!\n\n`;
-
-    if (extractedInfo.brand || extractedInfo.model) {
-        response += `🔍 현재 파악된 정보:\n`;
-        if (extractedInfo.brand)
-            response += `- 브랜드: ${extractedInfo.brand}\n`;
-        if (extractedInfo.model) response += `- 모델: ${extractedInfo.model}\n`;
-        if (extractedInfo.capacity)
-            response += `- 용량: ${extractedInfo.capacity}GB\n`;
-        if (extractedInfo.telecom)
-            response += `- 통신사: ${extractedInfo.telecom}\n`;
-        response += `\n`;
-    }
-
-    if (missingInfo.length > 0) {
-        response += `📋 정확한 비교를 위해 추가로 필요한 정보:\n`;
-        missingInfo.forEach((info) => {
-            response += `- ${info}\n`;
-        });
-        response += `\n`;
-    }
-
-    response += `💡 예시: "${extractedInfo.brand || "갤럭시"} ${
-        extractedInfo.model || "S25"
-    } ${extractedInfo.capacity || "256"} SK와 KT 중 어디가 더 저렴한가요?"`;
-
-    return response;
-}
-
 // —————— 6.5) GPT 자연어 처리 함수 ——————
 async function processWithGPT(userInput, scenario) {
     try {
-        let prompt = "";
-
-        if (scenario === "INFORMAL") {
-            prompt = `
+        const prompt = `
 다음 사용자 입력을 분석하여 정확한 휴대폰 정보를 추출해주세요:
 
 사용자 입력: "${userInput}"
@@ -643,25 +608,6 @@ async function processWithGPT(userInput, scenario) {
 
 JSON 형식으로만 답변해주세요.
 `;
-        } else if (scenario === "COMPARISON") {
-            prompt = `
-다음 사용자 입력을 분석하여 비교 요청의 의도를 파악해주세요:
-
-사용자 입력: "${userInput}"
-
-사용자가 비교하고자 하는 것이 무엇인지 분석하고, 정확한 비교를 위해 필요한 정보를 추출해주세요.
-
-다음 형식으로 답변해주세요:
-- 비교대상: (통신사, 모델, 요금제 등)
-- 추출된_브랜드: (갤럭시 또는 아이폰, 없으면 null)
-- 추출된_모델: (모델명, 없으면 null)
-- 추출된_용량: (숫자만, 없으면 null)
-- 추출된_통신사: (SK, KT, LG 중 하나, 없으면 null)
-- 누락된_정보: (비교를 위해 추가로 필요한 정보 리스트)
-
-JSON 형식으로만 답변해주세요.
-`;
-        }
 
         const response = await openai.chat.completions.create({
             model: "gpt-3.5-turbo",
@@ -922,35 +868,6 @@ function groupByChannelAndType(records) {
     return grouped;
 }
 
-function groupByTelecomAndType(records) {
-    const grouped = {};
-
-    for (const record of records) {
-        if (!grouped[record.telecom]) {
-            grouped[record.telecom] = {};
-        }
-        if (!grouped[record.telecom][record.type]) {
-            grouped[record.telecom][record.type] = [];
-        }
-        grouped[record.telecom][record.type].push(record);
-    }
-
-    return grouped;
-}
-
-function groupByType(records) {
-    const grouped = {};
-
-    for (const record of records) {
-        if (!grouped[record.type]) {
-            grouped[record.type] = [];
-        }
-        grouped[record.type].push(record);
-    }
-
-    return grouped;
-}
-
 function handleInformal(question, extracted) {
     let suggestion =
         "정확한 가격 안내를 위해 아래처럼 말씀해주시면 더 빠르게 안내드릴 수 있어요:\n";
@@ -964,17 +881,6 @@ function handleInformal(question, extracted) {
     }
 
     return suggestion;
-}
-
-function handleComparison(question) {
-    return `말씀해주신 질문은 가격 비교가 필요한 상황으로 보여요 😊  
-정확한 비교를 위해 아래 정보를 함께 알려주시면 도와드릴게요:
-📌 모델명 + 용량  
-📌 통신사 (SK/KT/LG)  
-📌 번호이동 or 기기변경  
-📌 온라인 or 내방 희망 여부
-
-예시: "아이폰 15 256 LG 번호이동은 얼마예요?"`;
 }
 
 // —————— 8) 메인 함수 ——————
