@@ -224,7 +224,7 @@ function normalizeCapacity(capacity) {
     return "기본"; // 숫자를 찾을 수 없는 경우
 }
 
-// 용량 매칭 함수 추가
+// 용량 매칭 함수 (최적화된 버전)
 function isCapacityMatch(userCapacity, recordCapacity) {
     // 둘 다 null이거나 빈 문자열인 경우
     if (
@@ -252,6 +252,11 @@ function isCapacityMatch(userCapacity, recordCapacity) {
 
     if (userNum && recordNum) {
         return userNum[0] === recordNum[0];
+    }
+
+    // 사용자 용량이 있고 레코드에 용량이 없는 경우 (예: S24 FE)
+    if (userCapacity && (!recordCapacity || recordCapacity === "기본")) {
+        return false;
     }
 
     return false;
@@ -490,6 +495,11 @@ function handleModelCapacity(extracted, records, commonServiceInfo) {
         availableModels
     );
 
+    // 해당 모델의 모든 레코드 확인
+    const modelRecords = records.filter(
+        (r) => r.modelNorm === bestMatch.target
+    );
+
     const matchingRecords = records.filter(
         (r) =>
             r.modelNorm === bestMatch.target &&
@@ -497,14 +507,50 @@ function handleModelCapacity(extracted, records, commonServiceInfo) {
     );
 
     if (matchingRecords.length === 0) {
+        // 사용 가능한 용량들도 표시
+        const availableCapacities = [
+            ...new Set(modelRecords.map((r) => r.capacity)),
+        ].filter((cap) => cap !== "기본" && cap !== ""); // 빈 값 제거
+
+        // 가장 가까운 용량 찾기
+        if (capacity && availableCapacities.length > 0) {
+            const requestedCapacity = parseInt(capacity);
+            const capacityNumbers = availableCapacities
+                .map((cap) => parseInt(cap))
+                .filter((num) => !isNaN(num))
+                .sort(
+                    (a, b) =>
+                        Math.abs(a - requestedCapacity) -
+                        Math.abs(b - requestedCapacity)
+                );
+
+            if (capacityNumbers.length > 0) {
+                const closestCapacity = capacityNumbers[0].toString();
+
+                // 가장 가까운 용량으로 다시 검색
+                const fallbackRecords = records.filter(
+                    (r) =>
+                        r.modelNorm === bestMatch.target &&
+                        r.capacity === closestCapacity
+                );
+
+                if (fallbackRecords.length > 0) {
+                    return formatAllConditions(
+                        fallbackRecords,
+                        `${brand} ${model} ${closestCapacity}GB (${capacity}GB 대신 가장 가까운 용량)`,
+                        commonServiceInfo
+                    );
+                }
+            }
+        }
+
         return `${brand} ${model} ${capacity}GB 정보를 찾을 수 없습니다.
         
 🔍 검색된 모델: ${bestMatch.target}
-📋 사용 가능한 모델들:
-${availableModels
-    .filter((m) => m.includes(brand.toLowerCase()))
-    .slice(0, 5)
-    .join("\n")}`;
+📦 사용 가능한 용량: ${availableCapacities.join(", ")}
+
+💡 사용 가능한 용량으로 다시 문의해주세요:
+예: "${brand} ${model} ${availableCapacities[0]} 얼마예요?"`;
     }
 
     // 전체 조건 (6가지) 안내
@@ -711,17 +757,23 @@ JSON 형식으로만 답변해주세요.
             max_tokens: 500,
         });
 
-        const gptResponse = response.choices[0].message.content.trim();
+        let gptResponse = response.choices[0].message.content.trim();
+
+        // 코드블록 제거 (```json ```이나 ``` ``` 제거)
+        gptResponse = gptResponse.replace(/```json\s*\n?/g, "");
+        gptResponse = gptResponse.replace(/```\s*$/g, "");
+        gptResponse = gptResponse.trim();
 
         // JSON 파싱 시도
         try {
             const parsed = JSON.parse(gptResponse);
             return parsed;
         } catch (e) {
+            console.error("GPT JSON 파싱 실패:", e.message);
             return null;
         }
     } catch (error) {
-        console.error("▶ GPT 처리 중 오류:", error.message);
+        console.error("GPT 처리 중 오류:", error.message);
         return null;
     }
 }
