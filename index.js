@@ -1,28 +1,48 @@
 // index.js
-import "dotenv/config";
 import { google } from "googleapis";
 import { OpenAI } from "openai";
 import stringSimilarity from "string-similarity";
+import { onRequest } from "firebase-functions/v2/https";
+import { setGlobalOptions } from "firebase-functions/v2";
+import { defineString, defineSecret } from "firebase-functions/params";
+
+// Firebase Functions v2 Global Options 설정
+setGlobalOptions({
+    maxInstances: 10,
+    region: "us-central1",
+    memory: "1GiB",
+    timeoutSeconds: 540,
+});
 
 // —————— 1) 환경 변수 & 상수 ——————
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const CRED_PATH = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+// Firebase Functions v2 환경변수 정의
+const spreadsheetId = defineString("SPREADSHEET_ID", {
+    description: "Google Sheets ID for phone price data",
+    default: "1baiOHh8zl7Zl44rgiZqD0tKlE428yk-Yr8R8k8XJC8w",
+});
+
+const openaiApiKey = defineSecret("OPENAI_API_KEY", {
+    description: "OpenAI API key for natural language processing",
+});
+
+// 상수
 const TELECOMS = ["SK", "KT", "LG"];
 const TYPES = ["번호이동", "기기변경"];
 
 // —————— 2) 클라이언트 초기화 ——————
+// Firebase Functions에서는 기본 인증 사용 (서비스 계정)
 const auth = new google.auth.GoogleAuth({
-    keyFile: CRED_PATH,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
 });
 const sheets = google.sheets({ version: "v4", auth });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// OpenAI 클라이언트는 함수 내에서 초기화 (환경변수 접근 때문)
 
 // —————— 2.1) 시트 목록 확인 함수 ——————
-async function listSheetNames() {
+async function listSheetNames(spreadsheetId) {
     try {
         const response = await sheets.spreadsheets.get({
-            spreadsheetId: SPREADSHEET_ID,
+            spreadsheetId: spreadsheetId,
         });
 
         const sheetNames = response.data.sheets.map(
@@ -37,9 +57,9 @@ async function listSheetNames() {
 }
 
 // —————— 3) 시트 구조 확인 함수 ——————
-async function checkSheetStructure() {
+async function checkSheetStructure(spreadsheetId) {
     // 먼저 시트 목록 확인
-    const sheetNames = await listSheetNames();
+    const sheetNames = await listSheetNames(spreadsheetId);
     if (sheetNames.length === 0) {
         throw new Error("시트 목록을 가져올 수 없습니다.");
     }
@@ -48,7 +68,7 @@ async function checkSheetStructure() {
     const firstSheet = sheetNames[0];
 
     const res = await sheets.spreadsheets.values.get({
-        spreadsheetId: SPREADSHEET_ID,
+        spreadsheetId: spreadsheetId,
         range: `${firstSheet}!A1:Z5`, // 처음 5행만 확인
     });
     const rows = res.data.values || [];
@@ -57,9 +77,9 @@ async function checkSheetStructure() {
 }
 
 // —————— 3) 스프레드시트 전체 구조 파싱 ——————
-async function parseFullSheetStructure() {
+async function parseFullSheetStructure(spreadsheetId) {
     // 먼저 시트 목록 확인
-    const sheetNames = await listSheetNames();
+    const sheetNames = await listSheetNames(spreadsheetId);
     if (sheetNames.length === 0) {
         throw new Error("시트 목록을 가져올 수 없습니다.");
     }
@@ -69,7 +89,7 @@ async function parseFullSheetStructure() {
     // 모든 시트 처리
     for (const sheetName of sheetNames) {
         const res = await sheets.spreadsheets.values.get({
-            spreadsheetId: SPREADSHEET_ID,
+            spreadsheetId: spreadsheetId,
             range: `${sheetName}!A1:Z100`,
         });
         const rows = res.data.values || [];
@@ -90,10 +110,11 @@ async function parseFullSheetStructure() {
             const serviceInfo = parseServiceInfoNew(row);
 
             // 번호이동 정보 (A, B, C, D열)
-            if (row[0] && row[1] && row[2] && row[3]) {
+            if (row[0] && row[1] && row[3]) {
+                // row[2] 조건 제거 (용량이 없을 수 있음)
                 const modelName = row[0].trim();
                 const modelNorm = normalizeModelName(modelName);
-                const capacity = row[2].trim(); // 용량은 이제 별도 컬럼에서 직접 가져옴
+                const capacity = normalizeCapacity(row[2]); // 용량 정규화 적용
 
                 allRecords.push({
                     modelRaw: modelName,
@@ -109,10 +130,11 @@ async function parseFullSheetStructure() {
             }
 
             // 기기변경 정보 (F, G, H, I열)
-            if (row[5] && row[6] && row[7] && row[8]) {
+            if (row[5] && row[6] && row[8]) {
+                // row[7] 조건 제거 (용량이 없을 수 있음)
                 const modelName = row[5].trim();
                 const modelNorm = normalizeModelName(modelName);
-                const capacity = row[7].trim(); // 용량은 이제 별도 컬럼에서 직접 가져옴
+                const capacity = normalizeCapacity(row[7]); // 용량 정규화 적용
 
                 allRecords.push({
                     modelRaw: modelName,
@@ -185,6 +207,54 @@ function normalizeModelName(modelName) {
 function cleanPrice(priceStr) {
     if (!priceStr) return "";
     return priceStr.toString().replace(/[^\d-]/g, "");
+}
+
+// 용량 정규화 함수 추가
+function normalizeCapacity(capacity) {
+    if (!capacity || capacity.trim() === "") {
+        return "기본"; // 용량이 없는 경우 기본값
+    }
+
+    // 숫자만 추출
+    const numbers = capacity.match(/\d+/g);
+    if (numbers && numbers.length > 0) {
+        return numbers[0]; // 첫 번째 숫자만 사용
+    }
+
+    return "기본"; // 숫자를 찾을 수 없는 경우
+}
+
+// 용량 매칭 함수 추가
+function isCapacityMatch(userCapacity, recordCapacity) {
+    // 둘 다 null이거나 빈 문자열인 경우
+    if (
+        (!userCapacity || userCapacity === "") &&
+        (!recordCapacity || recordCapacity === "")
+    ) {
+        return true;
+    }
+
+    // 하나가 "기본"이고 다른 하나가 용량이 없는 경우
+    if (userCapacity === "기본" || recordCapacity === "기본") {
+        return true;
+    }
+
+    // 정확히 일치하는 경우
+    if (userCapacity === recordCapacity) {
+        return true;
+    }
+
+    // 숫자로 비교 (용량 단위 무시)
+    const userNum = userCapacity ? userCapacity.toString().match(/\d+/g) : null;
+    const recordNum = recordCapacity
+        ? recordCapacity.toString().match(/\d+/g)
+        : null;
+
+    if (userNum && recordNum) {
+        return userNum[0] === recordNum[0];
+    }
+
+    return false;
 }
 
 function parseServiceInfoNew(row) {
@@ -344,7 +414,12 @@ function getPrimaryScenario(scenarios) {
 }
 
 // —————— 6) 시나리오별 응답 생성 ——————
-async function generateResponse(analysis, records, commonServiceInfo) {
+async function generateResponse(
+    analysis,
+    records,
+    commonServiceInfo,
+    openaiApiKey
+) {
     const { primaryScenario, extracted, originalQuestion } = analysis;
 
     switch (primaryScenario) {
@@ -366,7 +441,8 @@ async function generateResponse(analysis, records, commonServiceInfo) {
             return handleInformalWithGPT(
                 originalQuestion,
                 records,
-                commonServiceInfo
+                commonServiceInfo,
+                openaiApiKey
             );
         default:
             return "죄송합니다. 질문을 이해하지 못했습니다. 다시 말씀해주세요.";
@@ -415,7 +491,9 @@ function handleModelCapacity(extracted, records, commonServiceInfo) {
     );
 
     const matchingRecords = records.filter(
-        (r) => r.modelNorm === bestMatch.target && r.capacity === capacity
+        (r) =>
+            r.modelNorm === bestMatch.target &&
+            isCapacityMatch(capacity, r.capacity)
     );
 
     if (matchingRecords.length === 0) {
@@ -452,7 +530,7 @@ function handleModelCapacityTelecom(extracted, records, commonServiceInfo) {
     const matchingRecords = records.filter(
         (r) =>
             r.modelNorm === bestMatch.target &&
-            r.capacity === capacity &&
+            isCapacityMatch(capacity, r.capacity) &&
             r.telecom === telecom
     );
 
@@ -482,7 +560,7 @@ function handleFullCondition(extracted, records, commonServiceInfo) {
     const matchingRecords = records.filter(
         (r) =>
             r.modelNorm === bestMatch.target &&
-            r.capacity === capacity &&
+            isCapacityMatch(capacity, r.capacity) &&
             r.telecom === telecom &&
             r.type === type
     );
@@ -509,7 +587,12 @@ function handleComparison(question) {
 예시: "아이폰 15 256 LG 번호이동은 얼마예요?"`;
 }
 
-async function handleInformalWithGPT(question, records, commonServiceInfo) {
+async function handleInformalWithGPT(
+    question,
+    records,
+    commonServiceInfo,
+    openaiApiKey
+) {
     // 비교 키워드가 있으면 바로 비교 템플릿 반환
     const q = question.toLowerCase();
     if (
@@ -520,7 +603,7 @@ async function handleInformalWithGPT(question, records, commonServiceInfo) {
         return handleComparison(question);
     }
 
-    const gptResult = await processWithGPT(question, "INFORMAL");
+    const gptResult = await processWithGPT(question, "INFORMAL", openaiApiKey);
 
     if (!gptResult) {
         return handleInformal(question, {
@@ -582,8 +665,10 @@ async function handleInformalWithGPT(question, records, commonServiceInfo) {
 }
 
 // —————— 6.5) GPT 자연어 처리 함수 ——————
-async function processWithGPT(userInput, scenario) {
+async function processWithGPT(userInput, scenario, openaiApiKey) {
     try {
+        const openai = new OpenAI({ apiKey: openaiApiKey });
+
         const prompt = `
 다음 사용자 입력을 분석하여 정확한 휴대폰 정보를 추출해주세요:
 
@@ -883,38 +968,160 @@ function handleInformal(question, extracted) {
     return suggestion;
 }
 
-// —————— 8) 메인 함수 ——————
-(async () => {
-    try {
-        const question = process.argv.slice(2).join(" ");
+// —————— 8) Firebase Functions HTTP 엔드포인트 ——————
+export const phonePrice = onRequest(
+    {
+        invoker: "public",
+        cors: true,
+        secrets: [openaiApiKey],
+    },
+    async (req, res) => {
+        try {
+            // CORS 헤더 설정
+            res.set("Access-Control-Allow-Origin", "*");
+            res.set("Access-Control-Allow-Methods", "GET, POST");
+            res.set("Access-Control-Allow-Headers", "Content-Type");
 
-        // 구조 확인만 수행
-        if (question === "구조확인" || question === "check") {
-            await checkSheetStructure();
-            return;
-        }
+            if (req.method === "OPTIONS") {
+                res.status(204).send("");
+                return;
+            }
 
-        if (!question) {
-            console.error(
-                '⛔ 사용법: node index.js "갤럭시 S25 256 SK 번호이동 얼마예요?"'
+            // 질문 추출 (GET 또는 POST 방식 지원)
+            const question =
+                req.method === "GET" ? req.query.question : req.body?.question;
+
+            if (!question) {
+                res.status(400).json({
+                    error: "질문이 필요합니다.",
+                    usage: 'GET: ?question=질문내용 또는 POST: {"question": "질문내용"}',
+                });
+                return;
+            }
+
+            // 구조 확인 요청 처리
+            if (question === "구조확인" || question === "check") {
+                const result = await checkSheetStructure(spreadsheetId.value());
+                res.json({
+                    type: "structure_check",
+                    data: result,
+                });
+                return;
+            }
+
+            // 메인 로직 실행
+            const { allRecords, commonServiceInfo } =
+                await parseFullSheetStructure(spreadsheetId.value());
+            const analysis = analyzeQuestion(question);
+            const response = await generateResponse(
+                analysis,
+                allRecords,
+                commonServiceInfo,
+                openaiApiKey.value()
             );
-            console.error('⛔ 구조 확인: node index.js "구조확인"');
-            process.exit(1);
+
+            // 응답 반환
+            res.json({
+                question: question,
+                scenario: analysis.primaryScenario,
+                answer: response,
+            });
+        } catch (error) {
+            console.error("Error details:", error);
+            res.status(500).json({
+                error: "서버 오류가 발생했습니다.",
+                message: error.message,
+                stack: error.stack,
+                details: error.toString(),
+            });
         }
-
-        const { allRecords, commonServiceInfo } =
-            await parseFullSheetStructure();
-
-        const analysis = analyzeQuestion(question);
-        const response = await generateResponse(
-            analysis,
-            allRecords,
-            commonServiceInfo
-        );
-
-        console.log(response);
-    } catch (err) {
-        console.error("\n[ERROR]", err.message);
-        process.exit(1);
     }
-})();
+);
+
+// —————— 9) 카카오톡 챗봇 스킬 엔드포인트 ——————
+export const kakaoSkill = onRequest(
+    {
+        invoker: "public",
+        cors: true,
+        secrets: [openaiApiKey],
+    },
+    async (req, res) => {
+        try {
+            // CORS 헤더 설정
+            res.set("Access-Control-Allow-Origin", "*");
+            res.set("Access-Control-Allow-Methods", "POST");
+            res.set("Access-Control-Allow-Headers", "Content-Type");
+
+            if (req.method === "OPTIONS") {
+                res.status(204).send("");
+                return;
+            }
+
+            // 카카오톡 스킬 요청 파싱
+            const { userRequest, bot, contexts } = req.body;
+
+            if (!userRequest || !userRequest.utterance) {
+                return res.status(400).json({
+                    version: "2.0",
+                    template: {
+                        outputs: [
+                            {
+                                simpleText: {
+                                    text: "질문을 입력해주세요.",
+                                },
+                            },
+                        ],
+                    },
+                });
+            }
+
+            const question = userRequest.utterance;
+
+            // 메인 로직 실행
+            const { allRecords, commonServiceInfo } =
+                await parseFullSheetStructure(spreadsheetId.value());
+            const analysis = analyzeQuestion(question);
+            const answer = await generateResponse(
+                analysis,
+                allRecords,
+                commonServiceInfo,
+                openaiApiKey.value()
+            );
+
+            // 카카오톡 스킬 응답 형식으로 변환
+            const kakaoResponse = {
+                version: "2.0",
+                template: {
+                    outputs: [
+                        {
+                            simpleText: {
+                                text: answer,
+                            },
+                        },
+                    ],
+                },
+            };
+
+            res.json(kakaoResponse);
+        } catch (error) {
+            console.error("카카오톡 스킬 오류:", error);
+
+            // 에러 응답도 카카오톡 형식으로
+            res.json({
+                version: "2.0",
+                template: {
+                    outputs: [
+                        {
+                            simpleText: {
+                                text: "죄송합니다. 서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+                            },
+                        },
+                    ],
+                },
+            });
+        }
+    }
+);
+
+// Firebase Functions v2 전용 - CLI 테스트 코드 제거
+// 로컬 테스트는 Firebase Emulator를 사용하세요: firebase emulators:start --only functions
