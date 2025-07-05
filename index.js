@@ -30,7 +30,7 @@ async function listSheetNames() {
         const sheetNames = response.data.sheets.map(
             (sheet) => sheet.properties.title
         );
-        console.log("▶ 사용 가능한 시트 목록:", sheetNames);
+
         return sheetNames;
     } catch (error) {
         console.error("시트 목록을 가져오는 데 실패했습니다:", error.message);
@@ -46,22 +46,14 @@ async function checkSheetStructure() {
         throw new Error("시트 목록을 가져올 수 없습니다.");
     }
 
-    console.log(`▶ 시트 구조 확인 중...`);
-
     // 첫 번째 시트만 확인
     const firstSheet = sheetNames[0];
-    console.log(`▶ 확인할 시트: ${firstSheet}`);
 
     const res = await sheets.spreadsheets.values.get({
         spreadsheetId: SPREADSHEET_ID,
         range: `${firstSheet}!A1:Z5`, // 처음 5행만 확인
     });
     const rows = res.data.values || [];
-
-    console.log("\n=== 시트 구조 분석 ===");
-    rows.forEach((row, index) => {
-        console.log(`행 ${index + 1}:`, row);
-    });
 
     return { sheetNames, headerRows: rows };
 }
@@ -74,14 +66,10 @@ async function parseFullSheetStructure() {
         throw new Error("시트 목록을 가져올 수 없습니다.");
     }
 
-    console.log(`▶ 모든 시트에서 데이터 읽기 시작...`);
-
     const allRecords = [];
 
     // 모든 시트 처리
     for (const sheetName of sheetNames) {
-        console.log(`▶ 처리 중인 시트: ${sheetName}`);
-
         const res = await sheets.spreadsheets.values.get({
             spreadsheetId: SPREADSHEET_ID,
             range: `${sheetName}!A1:Z100`,
@@ -89,13 +77,11 @@ async function parseFullSheetStructure() {
         const rows = res.data.values || [];
 
         if (rows.length < 3) {
-            console.log(`▶ ${sheetName} 시트에 데이터가 부족합니다.`);
             continue;
         }
 
         // 시트별 정보 추출
         const sheetInfo = parseSheetInfo(sheetName);
-        console.log(`▶ 시트 정보:`, sheetInfo);
 
         // 데이터 파싱 (3행부터) - 새로운 구조 적용
         for (let i = 2; i < rows.length; i++) {
@@ -145,9 +131,6 @@ async function parseFullSheetStructure() {
         }
     }
 
-    console.log(`▶ 전체 파싱된 레코드 수: ${allRecords.length}`);
-    console.log(`▶ 레코드 샘플:`, allRecords.slice(0, 3));
-
     // 각 통신사별 공통 부가서비스 정보 추출 (복수 부가서비스 지원)
     const commonServiceInfo = {};
     allRecords.forEach((record) => {
@@ -170,7 +153,6 @@ async function parseFullSheetStructure() {
     });
 
     // 통신사별 공통 부가서비스 정보 추출 완료
-    console.log(`▶ 공통 부가서비스 정보:`, commonServiceInfo);
 
     return { allRecords, commonServiceInfo };
 }
@@ -431,10 +413,6 @@ function handleModelCapacity(extracted, records, commonServiceInfo) {
         availableModels
     );
 
-    console.log(
-        `▶ 모델 매칭: "${fullModelQuery}" → "${bestMatch.target}" (유사도: ${bestMatch.rating})`
-    );
-
     const matchingRecords = records.filter(
         (r) => r.modelNorm === bestMatch.target && r.capacity === capacity
     );
@@ -531,8 +509,6 @@ function handleComparison(question) {
 }
 
 async function handleInformalWithGPT(question, records, commonServiceInfo) {
-    console.log("▶ GPT로 비정형 입력 처리 중...");
-
     const gptResult = await processWithGPT(question, "INFORMAL");
 
     if (!gptResult) {
@@ -553,8 +529,6 @@ async function handleInformalWithGPT(question, records, commonServiceInfo) {
         telecom: gptResult.통신사 || gptResult.telecom,
         type: gptResult.타입 || gptResult.type,
     };
-
-    console.log("▶ GPT 정규화 결과:", normalizedExtracted);
 
     // 정규화된 결과로 다시 시나리오 분류
     const hasModel = normalizedExtracted.brand;
@@ -592,15 +566,11 @@ async function handleInformalWithGPT(question, records, commonServiceInfo) {
 }
 
 async function handleComparisonWithGPT(question, records) {
-    console.log("▶ GPT로 비교 요청 처리 중...");
-
     const gptResult = await processWithGPT(question, "COMPARISON");
 
     if (!gptResult) {
         return handleComparison(question);
     }
-
-    console.log("▶ GPT 비교 분석 결과:", gptResult);
 
     // 추출된 정보로 부분적 결과 제공 시도
     const extractedInfo = {
@@ -711,14 +681,12 @@ JSON 형식으로만 답변해주세요.
         });
 
         const gptResponse = response.choices[0].message.content.trim();
-        console.log("▶ GPT 분석 결과:", gptResponse);
 
         // JSON 파싱 시도
         try {
             const parsed = JSON.parse(gptResponse);
             return parsed;
         } catch (e) {
-            console.log("▶ GPT JSON 파싱 실패, 원본 응답:", gptResponse);
             return null;
         }
     } catch (error) {
@@ -1016,7 +984,6 @@ function handleComparison(question) {
 
         // 구조 확인만 수행
         if (question === "구조확인" || question === "check") {
-            console.log("⏳ 시트 구조 확인 중...");
             await checkSheetStructure();
             return;
         }
@@ -1029,23 +996,16 @@ function handleComparison(question) {
             process.exit(1);
         }
 
-        console.log("⏳ 스프레드시트 데이터 로딩 중...");
         const { allRecords, commonServiceInfo } =
             await parseFullSheetStructure();
 
-        console.log("⏳ 질문 분석 중...");
         const analysis = analyzeQuestion(question);
-        console.log("▶ 분석 결과:", analysis.primaryScenario);
-        console.log("▶ 추출 정보:", analysis.extracted);
-
-        console.log("⏳ 답변 생성 중...");
         const response = await generateResponse(
             analysis,
             allRecords,
             commonServiceInfo
         );
 
-        console.log("\n📤 최종 답변:\n");
         console.log(response);
     } catch (err) {
         console.error("\n[ERROR]", err.message);
