@@ -224,7 +224,7 @@ function normalizeCapacity(capacity) {
     return "기본"; // 숫자를 찾을 수 없는 경우
 }
 
-// 용량 매칭 함수 (최적화된 버전)
+// 용량 매칭 함수 (개선된 버전)
 function isCapacityMatch(userCapacity, recordCapacity) {
     // 둘 다 null이거나 빈 문자열인 경우
     if (
@@ -234,9 +234,15 @@ function isCapacityMatch(userCapacity, recordCapacity) {
         return true;
     }
 
-    // 하나가 "기본"이고 다른 하나가 용량이 없는 경우
-    if (userCapacity === "기본" || recordCapacity === "기본") {
+    // 사용자가 용량을 지정하지 않은 경우, 모든 레코드 매칭
+    if (!userCapacity || userCapacity === "") {
         return true;
+    }
+
+    // 레코드에 용량이 없는 경우 ("기본" 또는 빈 값)
+    if (!recordCapacity || recordCapacity === "기본" || recordCapacity === "") {
+        // 사용자가 용량을 지정했다면 매칭하지 않음
+        return false;
     }
 
     // 정확히 일치하는 경우
@@ -252,11 +258,6 @@ function isCapacityMatch(userCapacity, recordCapacity) {
 
     if (userNum && recordNum) {
         return userNum[0] === recordNum[0];
-    }
-
-    // 사용자 용량이 있고 레코드에 용량이 없는 경우 (예: S24 FE)
-    if (userCapacity && (!recordCapacity || recordCapacity === "기본")) {
-        return false;
     }
 
     return false;
@@ -304,7 +305,7 @@ function analyzeQuestion(question) {
 }
 
 function checkModelOnly(q) {
-    const modelMatch = /(갤럭시|아이폰)/i.exec(q);
+    const modelMatch = /(갤럭시|아이폰|galaxy|iphone)/i.exec(q);
     const allNumbers = q.match(/\b\d+\b/g);
     let hasValidCapacity = false;
 
@@ -318,7 +319,7 @@ function checkModelOnly(q) {
 }
 
 function checkModelCapacity(q) {
-    const modelMatch = /(갤럭시|아이폰)/i.exec(q);
+    const modelMatch = /(갤럭시|아이폰|galaxy|iphone)/i.exec(q);
     const allNumbers = q.match(/\b\d+\b/g);
     let hasValidCapacity = false;
 
@@ -334,7 +335,7 @@ function checkModelCapacity(q) {
 }
 
 function checkModelCapacityTelecom(q) {
-    const modelMatch = /(갤럭시|아이폰)/i.exec(q);
+    const modelMatch = /(갤럭시|아이폰|galaxy|iphone)/i.exec(q);
     const capacityMatch = /(\d+)(?:GB)?/i.exec(q);
     const telecomMatch = /(SK|KT|LG)/i.exec(q);
     const typeMatch = /(번호이동|기기변경|기변|번이)/i.exec(q);
@@ -342,7 +343,7 @@ function checkModelCapacityTelecom(q) {
 }
 
 function checkFullCondition(q) {
-    const modelMatch = /(갤럭시|아이폰)/i.exec(q);
+    const modelMatch = /(갤럭시|아이폰|galaxy|iphone)/i.exec(q);
     const capacityMatch = /(\d+)(?:GB)?/i.exec(q);
     const telecomMatch = /(SK|KT|LG)/i.exec(q);
     const typeMatch = /(번호이동|기기변경|기변|번이)/i.exec(q);
@@ -357,13 +358,15 @@ function checkInformal(q) {
         /번이|기변/.test(q) ||
         /\d+프|프\d+/.test(q) || // 16프, 프16 등
         /가격\s*좀|좀\s*가격/.test(q) || // 가격좀, 좀 가격
-        /\w+\d+\w+/.test(q) // 연속된 문자+숫자+문자 패턴
+        (/\w+\d+\w+/.test(q) &&
+            !/^(갤럭시|아이폰|galaxy|iphone)\s+\w*\d+\w*$/i.test(q)) // 연속된 문자+숫자+문자 패턴 (단, 정상적인 모델명 제외)
     );
 }
 
 function extractFromQuestion(q) {
-    // 더 정밀한 정규식 패턴 사용
-    const modelMatch = /(갤럭시|아이폰)\s*(\S*?)\s*/i.exec(q);
+    // 더 정밀한 정규식 패턴 사용 - 갤럭시 + 인식 개선
+    const modelMatch =
+        /(갤럭시|아이폰|galaxy|iphone)\s*([^0-9]*?)(?=\s*\d|\s*$)/i.exec(q);
     const capacityMatch = /\b(\d+)(?:GB)?\b/gi.exec(q); // 단어 경계 사용
     const telecomMatch = /(SK|SKT|KT|LG)/i.exec(q);
     const typeMatch = /(번호이동|기기변경|기변|번이)/i.exec(q);
@@ -374,7 +377,17 @@ function extractFromQuestion(q) {
 
     if (modelMatch) {
         brand = modelMatch[1];
+        // 영어를 한글로 변환
+        if (brand.toLowerCase() === "galaxy") brand = "갤럭시";
+        if (brand.toLowerCase() === "iphone") brand = "아이폰";
+
         model = modelMatch[2] || "";
+
+        // 모델명 정리: 양쪽 공백 제거 및 + 기호를 plus로 변환
+        model = model.trim();
+        if (model.includes("+")) {
+            model = model.replace(/\s*\+\s*/g, " plus").trim();
+        }
     }
 
     // 용량 추출: 모든 숫자를 찾아서 가장 큰 것을 용량으로 간주
@@ -507,10 +520,10 @@ function handleModelCapacity(extracted, records, commonServiceInfo) {
     );
 
     if (matchingRecords.length === 0) {
-        // 사용 가능한 용량들도 표시
+        // 사용 가능한 용량들도 표시 (용량 없는 모델 포함)
         const availableCapacities = [
             ...new Set(modelRecords.map((r) => r.capacity)),
-        ].filter((cap) => cap !== "기본" && cap !== ""); // 빈 값 제거
+        ].filter((cap) => cap !== ""); // 빈 값만 제거, "기본"은 포함
 
         // 가장 가까운 용량 찾기
         if (capacity && availableCapacities.length > 0) {
@@ -720,9 +733,14 @@ async function processWithGPT(userInput, scenario, openaiApiKey) {
 
 사용자 입력: "${userInput}"
 
+**중요한 변환 규칙:**
+1. "+" 기호는 반드시 "PLUS"로 변환하세요
+2. "galaxy s25 +" → 모델은 "S25 PLUS"가 되어야 합니다
+3. "갤럭시 s25 +" → 모델은 "S25 PLUS"가 되어야 합니다
+
 다음 형식으로 답변해주세요:
 - 브랜드: (갤럭시 또는 아이폰)
-- 모델: (정확한 모델명, 예: S25, 16, 16 PRO Max)
+- 모델: (정확한 모델명, 예: S25 PLUS, S25, 16 PRO Max)
 - 용량: (숫자만, 예: 256, 512. 명시되지 않았다면 일반적인 용량인 256을 제안)
 - 통신사: (SK, KT, LG 중 하나, 없으면 null)
 - 타입: (번호이동 또는 기기변경, 없으면 null)
@@ -731,6 +749,8 @@ async function processWithGPT(userInput, scenario, openaiApiKey) {
 - "프맥" → "PRO Max"
 - "울트라" → "울트라" 
 - "플러스" → "PLUS"
+- "+" → "PLUS" (매우 중요!)
+- "s25 +" → "S25 PLUS"
 - "16프" → "16 PRO"
 - "기변" → "기기변경"
 - "번이" → "번호이동"
@@ -741,7 +761,7 @@ JSON 형식으로만 답변해주세요.
 `;
 
         const response = await openai.chat.completions.create({
-            model: "gpt-3.5-turbo",
+            model: "gpt-4o",
             messages: [
                 {
                     role: "system",
@@ -786,8 +806,6 @@ function formatAllConditions(records, modelInfo, commonServiceInfo) {
 
     for (const telecom of TELECOMS) {
         if (grouped[telecom]) {
-            result += `═══════════════════════════════════════════════════════════════════════════════\n`;
-
             // 온라인 가격 조건
             if (grouped[telecom]["온라인"]) {
                 result += `📦 온라인 가격 조건 안내 (${telecom})\n\n`;
@@ -888,7 +906,6 @@ function formatTelecomConditions(records, modelInfo, commonServiceInfo) {
     const grouped = groupByChannelAndType(records);
 
     let result = `📱 ${modelInfo} 조건을 안내드려요:\n\n`;
-    result += `═══════════════════════════════════════════════════════════════════════════════\n`;
 
     // 온라인 조건
     if (grouped["온라인"]) {
@@ -936,7 +953,6 @@ function formatSpecificCondition(allRecords, modelInfo, commonServiceInfo) {
     const type = firstRecord.type;
 
     let result = `📱 ${modelInfo} 조건을 안내드려요:\n\n`;
-    result += `═══════════════════════════════════════════════════════════════════════════════\n`;
 
     // 온라인 조건 찾기
     const onlineRecord = allRecords.find(
