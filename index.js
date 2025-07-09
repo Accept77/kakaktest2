@@ -250,17 +250,30 @@ async function parseUserInput(userInput, openaiApiKey) {
 - "갤럭시 S24 FE" → 기본모델: "S24", 옵션: "FE"
 - "갤럭시 Z플립6" → 기본모델: "플립6", 옵션: null
 - "갤럭시 플립6" → 기본모델: "플립6", 옵션: null
+- "갤럭시 Z플립5" → 기본모델: "플립5", 옵션: null
+- "갤럭시 플립5" → 기본모델: "플립5", 옵션: null
 - "갤럭시 Z폴드6" → 기본모델: "폴드6", 옵션: null
 - "갤럭시 폴드6" → 기본모델: "폴드6", 옵션: null
+- "갤럭시 Z폴드5" → 기본모델: "폴드5", 옵션: null
+- "갤럭시 폴드5" → 기본모델: "폴드5", 옵션: null
 - "갤럭시 S25 엣지" → 기본모델: "S25", 옵션: "엣지"
 - "16" → 브랜드: "아이폰", 기본모델: "16"
 - "15" → 브랜드: "아이폰", 기본모델: "15"
-- "프로" → 브랜드: null, 기본모델: null, 옵션: "프로"
-- "맥스" → 브랜드: null, 기본모델: null, 옵션: "맥스"
+- "플립6" → 브랜드: "갤럭시", 기본모델: "플립6"
+- "플립5" → 브랜드: "갤럭시", 기본모델: "플립5"
+- "폴드6" → 브랜드: "갤럭시", 기본모델: "폴드6"
+- "폴드5" → 브랜드: "갤럭시", 기본모델: "폴드5"
+
 - "플러스" → 브랜드: null, 기본모델: null, 옵션: "플러스"
 - "+" → 브랜드: null, 기본모델: null, 옵션: "플러스"
 - "S24+" → 기본모델: "S24", 옵션: "플러스"
 - "16+" → 브랜드: "아이폰", 기본모델: "16", 옵션: "플러스"
+- "프로" → 브랜드: null, 기본모델: null, 옵션: "프로"
+- "맥스" → 브랜드: null, 기본모델: null, 옵션: "프로 맥스"
+- "프로 맥스" → 브랜드: null, 기본모델: null, 옵션: "프로 맥스"
+- "pro" → 브랜드: null, 기본모델: null, 옵션: "프로"
+- "max" → 브랜드: null, 기본모델: null, 옵션: "프로 맥스"
+- "pro max" → 브랜드: null, 기본모델: null, 옵션: "프로 맥스"
 `;
 
         const completion = await openai.chat.completions.create({
@@ -392,11 +405,19 @@ function findMatchingRecords(parsedData, allRecords) {
             // 한글 옵션을 영문으로 변환해서 검색
             if (optionLower === "프로") {
                 return (
-                    modelLower.includes("pro") || modelLower.includes("프로")
+                    (modelLower.includes("pro") &&
+                        !modelLower.includes("max")) ||
+                    (modelLower.includes("프로") &&
+                        !modelLower.includes("맥스"))
                 );
-            } else if (optionLower === "맥스") {
+            } else if (
+                optionLower === "프로 맥스" ||
+                optionLower === "프로맥스"
+            ) {
                 return (
-                    modelLower.includes("max") || modelLower.includes("맥스")
+                    (modelLower.includes("pro") &&
+                        modelLower.includes("max")) ||
+                    (modelLower.includes("프로") && modelLower.includes("맥스"))
                 );
             } else if (optionLower === "플러스") {
                 return (
