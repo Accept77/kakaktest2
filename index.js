@@ -1,12 +1,9 @@
-// index.js
 import { google } from "googleapis";
 import { OpenAI } from "openai";
-import stringSimilarity from "string-similarity";
 import { onRequest } from "firebase-functions/v2/https";
 import { setGlobalOptions } from "firebase-functions/v2";
 import { defineString, defineSecret } from "firebase-functions/params";
 
-// Firebase Functions v2 Global Options 설정
 setGlobalOptions({
     maxInstances: 10,
     region: "us-central1",
@@ -14,7 +11,6 @@ setGlobalOptions({
     timeoutSeconds: 540,
 });
 
-// —————— 1) 환경 변수 & 상수 ——————
 const spreadsheetId = defineString("SPREADSHEET_ID", {
     description: "Google Sheets ID for phone price data",
     default: "1baiOHh8zl7Zl44rgiZqD0tKlE428yk-Yr8R8k8XJC8w",
@@ -24,15 +20,12 @@ const openaiApiKey = defineSecret("OPENAI_API_KEY", {
     description: "OpenAI API key for natural language processing",
 });
 
-// —————— 2) 클라이언트 초기화 ——————
 const auth = new google.auth.GoogleAuth({
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-// OpenAI 클라이언트는 함수 내에서 초기화 (환경변수 접근 때문)
-
-// —————— 3) 시트 데이터 파싱 ——————
+// 시트 파싱 함수
 async function parseFullSheetStructure(spreadsheetId) {
     const sheetNames = await listSheetNames(spreadsheetId);
     if (sheetNames.length === 0) {
@@ -40,6 +33,7 @@ async function parseFullSheetStructure(spreadsheetId) {
     }
 
     const allRecords = [];
+    const servicesBySheet = {}; // 시트별 부가서비스 정보 저장
 
     for (const sheetName of sheetNames) {
         const res = await sheets.spreadsheets.values.get({
@@ -53,16 +47,69 @@ async function parseFullSheetStructure(spreadsheetId) {
         if (rows.length < 3) continue;
 
         const sheetInfo = parseSheetInfo(sheetName);
+        const sheetServices = []; // 현재 시트의 부가서비스 정보들
 
+        // 먼저 시트 전체를 스캔하여 부가서비스 정보 수집
         for (let i = 2; i < rows.length; i++) {
             const row = rows[i];
             if (!row[0] || row[0].trim() === "") continue;
 
-            const serviceInfo = parseServiceInfo(row);
+            // 부가서비스 정보 (K, L, M, N열) 수집
+            if (
+                row[10] &&
+                row[10].toString().trim() !== "" &&
+                row[10].toString().trim() !== "테스트"
+            ) {
+                const serviceInfo = {
+                    serviceName: row[10].toString().trim(),
+                    monthlyFee:
+                        row[11] && row[11].toString().trim() !== ""
+                            ? cleanPrice(row[11])
+                            : "0",
+                    duration:
+                        row[12] && row[12].toString().trim() !== ""
+                            ? row[12].toString().trim()
+                            : "",
+                    additionalFee:
+                        row[13] && row[13].toString().trim() !== ""
+                            ? cleanPrice(row[13])
+                            : "0",
+                };
+
+                // 테스트 데이터 필터링
+                if (
+                    !serviceInfo.monthlyFee.includes("33333333333333") &&
+                    !serviceInfo.additionalFee.includes("33333333333333")
+                ) {
+                    // 중복 제거
+                    const serviceKey = `${serviceInfo.serviceName}_${serviceInfo.monthlyFee}_${serviceInfo.duration}_${serviceInfo.additionalFee}`;
+                    if (
+                        !sheetServices.find(
+                            (s) =>
+                                `${s.serviceName}_${s.monthlyFee}_${s.duration}_${s.additionalFee}` ===
+                                serviceKey
+                        )
+                    ) {
+                        sheetServices.push(serviceInfo);
+                        console.log(
+                            `시트 ${sheetName}에서 부가서비스 발견:`,
+                            serviceInfo
+                        );
+                    }
+                }
+            }
+        }
+
+        servicesBySheet[sheetName] = sheetServices;
+
+        // 이제 각 행의 데이터를 처리하여 레코드 생성
+        for (let i = 2; i < rows.length; i++) {
+            const row = rows[i];
+            if (!row[0] || row[0].trim() === "") continue;
 
             // 번호이동 정보 (A, B, C, D열)
             if (row[0] && row[1] && row[3]) {
-                allRecords.push({
+                const record = {
                     modelRaw: row[0].trim(),
                     modelNorm: normalizeModelName(row[0].trim()),
                     capacity: normalizeCapacity(row[2]),
@@ -71,13 +118,15 @@ async function parseFullSheetStructure(spreadsheetId) {
                     channel: sheetInfo.channel,
                     plan: cleanPrice(row[1]),
                     price: cleanPrice(row[3]),
-                    serviceInfo: serviceInfo,
-                });
+                    serviceInfo:
+                        sheetServices.length > 0 ? sheetServices : null,
+                };
+                allRecords.push(record);
             }
 
             // 기기변경 정보 (F, G, H, I열)
             if (row[5] && row[6] && row[8]) {
-                allRecords.push({
+                const record = {
                     modelRaw: row[5].trim(),
                     modelNorm: normalizeModelName(row[5].trim()),
                     capacity: normalizeCapacity(row[7]),
@@ -86,8 +135,10 @@ async function parseFullSheetStructure(spreadsheetId) {
                     channel: sheetInfo.channel,
                     plan: cleanPrice(row[6]),
                     price: cleanPrice(row[8]),
-                    serviceInfo: serviceInfo,
-                });
+                    serviceInfo:
+                        sheetServices.length > 0 ? sheetServices : null,
+                };
+                allRecords.push(record);
             }
         }
     }
@@ -95,7 +146,7 @@ async function parseFullSheetStructure(spreadsheetId) {
     return { allRecords };
 }
 
-// —————— 4) 유틸리티 함수들 ——————
+// 시트 목록 가져오기
 async function listSheetNames(spreadsheetId) {
     try {
         const response = await sheets.spreadsheets.get({
@@ -108,6 +159,7 @@ async function listSheetNames(spreadsheetId) {
     }
 }
 
+// 시트 정보 파싱 함수
 function parseSheetInfo(sheetName) {
     const telecom = sheetName.includes("SK")
         ? "SK"
@@ -126,6 +178,7 @@ function parseSheetInfo(sheetName) {
     return { telecom, channel };
 }
 
+// 모델명 정규화 함수
 function normalizeModelName(modelName) {
     return modelName
         .toLowerCase()
@@ -133,37 +186,28 @@ function normalizeModelName(modelName) {
         .replace(/[^a-z0-9ㄱ-ㅎ가-힣]/g, "");
 }
 
+// 용량 정규화 함수
 function normalizeCapacity(capacity) {
     if (!capacity || capacity === "") return "기본";
-
-    // 숫자나 문자열을 문자열로 변환한 후 처리
     const capacityStr = capacity.toString().trim();
     if (capacityStr === "") return "기본";
-
     const numbers = capacityStr.match(/\d+/g);
     return numbers && numbers.length > 0 ? numbers[0] : "기본";
 }
 
+// 가격 정규화 함수
 function cleanPrice(priceStr) {
     if (!priceStr) return "";
     return priceStr.toString().replace(/[^\d-]/g, "");
 }
 
-function parseServiceInfo(row) {
-    // 실제 시트 구조에 맞게 수정: K~N열 (row[10]~row[13])
-    if (row[10] && row[11] && row[12] && row[13]) {
-        const serviceInfo = {
-            serviceName: row[10].trim(), // K열: 부가서비스명
-            monthlyFee: row[11], // L열: 월 청구금 (원본 유지)
-            duration: row[12].trim(), // M열: 유지 기간
-            additionalFee: cleanPrice(row[13]), // N열: 미가입 추가금
-        };
-        return serviceInfo;
-    }
-    return null;
+// 가격 포맷팅 함수
+function formatPrice(priceStr) {
+    if (!priceStr || priceStr === "0" || priceStr === "") return "0";
+    return parseInt(priceStr).toLocaleString();
 }
 
-// —————— 5) GPT 파싱 함수 ——————
+// GPT 파싱 함수
 async function parseUserInput(userInput, openaiApiKey) {
     try {
         const openai = new OpenAI({ apiKey: openaiApiKey });
@@ -173,1333 +217,590 @@ async function parseUserInput(userInput, openaiApiKey) {
 
 사용자 입력: "${userInput}"
 
-**추출 규칙:**
-1. 브랜드: 갤럭시 또는 아이폰
-2. 모델: 정확한 모델명 (예: S25, S25 PLUS, 16 PRO, 16 PRO Max)
-3. 용량: 숫자만 (예: 128, 256, 512)
-4. 통신사: SK, KT, LG 중 하나
-5. 타입: 번호이동 또는 기기변경
-6. 질문타입: 단순조회/비교질문/오타포함 중 하나
-7. 원본추정: 오타나 축약어가 포함된 경우 추정되는 정확한 표현
-
-**변환 규칙:**
-- "프맥/프로맥스/16프맥" → "16 PRO Max"
-- "울트라" → "ULTRA"
-- "플/플러스" → "PLUS"
-- "기변" → "기기변경"
-- "번이" → "번호이동"
-- "sk/SK" → "SK"
-- 띄어쓰기 무시하고 파싱
-
-**질문타입 판단:**
-- 단순조회: 브랜드만 있거나 정상적인 모델명 문의 (예: "갤럭시", "갤럭시 폴드", "아이폰", "아이폰 16" 등)
-- 비교질문: "뭐가 더 싸요?", "어디가 저렴한가요?", "vs", "비교" 등이 명시적으로 포함된 경우
-- 오타포함: 띄어쓰기 없이 붙어있거나 심각한 축약어가 포함된 경우 (예: "갤럭시s25프맥", "아이폰16프맥")
-
-**중요**: "갤럭시", "아이폰", "갤럭시 폴드" 같은 일반적인 브랜드나 모델명은 모두 "단순조회"로 분류하세요.
-
-명시되지 않은 항목은 null로 설정해주세요.
-
-JSON 형식으로만 답변:
+다음 JSON 형태로만 응답해주세요:
 {
-  "브랜드": "갤럭시",
-  "모델": "S25",
-  "용량": "256",
-  "통신사": "SK",
-  "타입": "번호이동",
-  "질문타입": "오타포함",
-  "원본추정": "갤럭시 S25 256 SK 번호이동 얼마예요?"
+    "브랜드": "갤럭시 또는 아이폰",
+    "기본모델": "기본 모델명",
+    "옵션": "추가 옵션",
+    "용량": "숫자만 (예: 128, 256, 512)",
+    "통신사": "SK, KT, LG 중 하나",
+    "타입": "번호이동 또는 기기변경"
 }
+
+규칙:
+- 브랜드: 갤럭시/Galaxy → "갤럭시", 아이폰/iPhone → "아이폰"
+- 기본모델: S24, S25, 16, 15, 플립6, 폴드6 등 기본 모델명만 (Z 제외)
+- 옵션: 플러스, 울트라, 프로, 프로맥스, 엣지, SE, FE, Plus, Ultra, Pro, Pro Max, Edge 등
+- 용량: 128, 256, 512 등 숫자만
+- 통신사: SK, KT, LG만 인식
+- 타입: 번호이동/번이 → "번호이동", 기기변경/기변 → "기기변경"
+- 정보가 없으면 null
+- "+"는 "플러스"로 정규화
+
+중요한 모델명 정규화:
+- Z플립, Z 플립, 플립 → "플립" (또는 해당 숫자)
+- Z폴드, Z 폴드, 폴드 → "폴드" (또는 해당 숫자)
+- 순수한 숫자(16, 15, 14, 13)는 아이폰 모델로 인식
+- +, plus, 플러스 → 모두 "플러스"로 정규화
+
+예시:
+- "갤럭시 S24 울트라" → 기본모델: "S24", 옵션: "울트라"
+- "아이폰 16 프로맥스" → 기본모델: "16", 옵션: "프로맥스"
+- "아이폰 16 SE" → 기본모델: "16", 옵션: "SE"
+- "갤럭시 S24 FE" → 기본모델: "S24", 옵션: "FE"
+- "갤럭시 Z플립6" → 기본모델: "플립6", 옵션: null
+- "갤럭시 플립6" → 기본모델: "플립6", 옵션: null
+- "갤럭시 Z폴드6" → 기본모델: "폴드6", 옵션: null
+- "갤럭시 폴드6" → 기본모델: "폴드6", 옵션: null
+- "갤럭시 S25 엣지" → 기본모델: "S25", 옵션: "엣지"
+- "16" → 브랜드: "아이폰", 기본모델: "16"
+- "15" → 브랜드: "아이폰", 기본모델: "15"
+- "프로" → 브랜드: null, 기본모델: null, 옵션: "프로"
+- "맥스" → 브랜드: null, 기본모델: null, 옵션: "맥스"
+- "플러스" → 브랜드: null, 기본모델: null, 옵션: "플러스"
+- "+" → 브랜드: null, 기본모델: null, 옵션: "플러스"
+- "S24+" → 기본모델: "S24", 옵션: "플러스"
+- "16+" → 브랜드: "아이폰", 기본모델: "16", 옵션: "플러스"
 `;
 
-        const response = await openai.chat.completions.create({
-            model: "gpt-4o",
-            messages: [
-                {
-                    role: "system",
-                    content:
-                        "휴대폰 가격 문의를 분석하는 전문가입니다. JSON 형식으로만 답변해주세요.",
-                },
-                {
-                    role: "user",
-                    content: prompt,
-                },
-            ],
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [{ role: "user", content: prompt }],
             temperature: 0.1,
-            max_tokens: 300,
         });
 
-        let gptResponse = response.choices[0].message.content.trim();
-        gptResponse = gptResponse.replace(/```json\s*\n?/g, "");
-        gptResponse = gptResponse.replace(/```\s*$/g, "");
-        gptResponse = gptResponse.trim();
+        const responseText = completion.choices[0].message.content.trim();
+        console.log("GPT 응답:", responseText);
 
-        return JSON.parse(gptResponse);
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+            return JSON.parse(jsonMatch[0]);
+        }
+
+        return null;
     } catch (error) {
-        console.error("GPT 파싱 오류:", error.message);
+        console.error("GPT 파싱 실패:", error);
         return null;
     }
 }
 
-// —————— 6) 데이터 매칭 함수 ——————
+// 검색 및 응답 생성
 function findMatchingRecords(parsedData, allRecords) {
-    const { 브랜드, 모델, 용량, 통신사, 타입 } = parsedData;
+    const { 브랜드, 기본모델, 옵션, 용량, 통신사, 타입 } = parsedData;
 
-    // 모델명도 브랜드도 없으면 빈 배열 반환
-    if (!브랜드 && !모델) {
-        return [];
-    }
+    console.log("검색 조건:", parsedData);
+    console.log("전체 레코드 수:", allRecords.length);
 
-    // 검색 쿼리 생성
-    let searchQuery = "";
+    let filteredRecords = allRecords;
 
-    // 브랜드와 모델이 모두 있는 경우
-    if (브랜드 && 모델 && 모델 !== 브랜드) {
-        searchQuery = (브랜드 + " " + 모델).toLowerCase().replace(/\s+/g, "");
-    }
-    // 브랜드만 있는 경우
-    else if (브랜드 && (!모델 || 모델 === 브랜드)) {
-        searchQuery = 브랜드.toLowerCase().replace(/\s+/g, "");
-    }
-    // 모델명만 있는 경우 (브랜드 없이)
-    else if (모델 && !브랜드) {
-        searchQuery = 모델.toLowerCase().replace(/\s+/g, "");
-    }
+    // 브랜드 필터링
+    if (브랜드) {
+        console.log(`브랜드 필터링 시작: ${브랜드}`);
+        const beforeBrandFilter = filteredRecords.length;
 
-    // 용량이 없는 경우 - 개선된 검색 알고리즘 적용
-    if (!용량) {
-        const availableModels = [...new Set(allRecords.map((r) => r.modelRaw))];
-        const matchingModels = findBestModelMatches(
-            searchQuery,
-            availableModels
-        );
+        filteredRecords = filteredRecords.filter((record) => {
+            const modelLower = record.modelRaw.toLowerCase();
+            const brandLower = 브랜드.toLowerCase();
 
-        const filteredRecords = allRecords.filter((r) =>
-            matchingModels.includes(r.modelRaw)
-        );
-
-        // 브랜드만 있고 모델이 없는 경우에 대한 추가 필터링
-        // 너무 많은 결과가 나오는 것을 방지하기 위해 결과 수 제한
-        if (
-            브랜드 &&
-            (!모델 || 모델 === 브랜드) &&
-            filteredRecords.length > 20
-        ) {
-            // 브랜드만 있는 경우, 최신 모델이나 인기 모델을 우선 표시
-            const priorityKeywords = [
-                "S25",
-                "S24",
-                "16",
-                "15",
-                "폴드",
-                "fold",
-                "플립",
-                "flip",
-                "울트라",
-                "ultra",
-            ];
-
-            const priorityRecords = filteredRecords.filter((r) =>
-                priorityKeywords.some((keyword) =>
-                    r.modelRaw.toLowerCase().includes(keyword.toLowerCase())
-                )
-            );
-
-            if (priorityRecords.length > 0 && priorityRecords.length <= 20) {
-                return priorityRecords;
+            // 갤럭시 브랜드의 경우 플립, 폴드도 포함
+            if (brandLower === "갤럭시") {
+                return (
+                    modelLower.includes("갤럭시") ||
+                    modelLower.includes("galaxy") ||
+                    modelLower.includes("플립") ||
+                    modelLower.includes("폴드")
+                );
             }
+
+            return modelLower.includes(brandLower);
+        });
+
+        console.log(
+            `브랜드 필터링 완료: ${beforeBrandFilter} -> ${filteredRecords.length}`
+        );
+    }
+
+    // 기본 모델 필터링
+    if (기본모델) {
+        console.log(`기본모델 필터링 시작: ${기본모델}`);
+        const beforeFilter = filteredRecords.length;
+
+        // 플립/폴드 관련 레코드 디버깅
+        if (기본모델.includes("플립") || 기본모델.includes("폴드")) {
+            console.log("플립/폴드 모델 검색 - 현재 레코드들:");
+            filteredRecords.slice(0, 5).forEach((record) => {
+                console.log(`- ${record.modelRaw} (${record.capacity}GB)`);
+            });
         }
 
-        return filteredRecords;
+        filteredRecords = filteredRecords.filter((record) => {
+            const modelLower = record.modelRaw.toLowerCase();
+            const basemodelLower = 기본모델.toLowerCase();
+
+            // 플립과 폴드의 경우 특별 처리 (공백 제거하여 비교)
+            if (
+                basemodelLower.includes("플립") ||
+                basemodelLower.includes("폴드")
+            ) {
+                // 공백 제거하여 비교
+                const modelNoSpace = modelLower.replace(/\s+/g, "");
+                const basemodelNoSpace = basemodelLower.replace(/\s+/g, "");
+                const result = modelNoSpace.includes(basemodelNoSpace);
+                if (result) {
+                    console.log(
+                        `플립/폴드 매칭: ${record.modelRaw} -> ${basemodelLower} (공백제거: ${modelNoSpace} -> ${basemodelNoSpace})`
+                    );
+                }
+                return result;
+            }
+
+            // 옵션이 없으면 정확한 매칭
+            if (!옵션) {
+                // 기본 모델명이 정확히 일치하는지 확인
+                return (
+                    modelLower.includes(basemodelLower) &&
+                    !modelLower.includes("플러스") &&
+                    !modelLower.includes("울트라") &&
+                    !modelLower.includes("엣지") &&
+                    !modelLower.includes("프로") &&
+                    !modelLower.includes("맥스") &&
+                    !modelLower.includes("plus") &&
+                    !modelLower.includes("ultra") &&
+                    !modelLower.includes("edge") &&
+                    !modelLower.includes("pro") &&
+                    !modelLower.includes("max") &&
+                    !modelLower.includes("se") &&
+                    !modelLower.includes("fe")
+                );
+            } else {
+                // 옵션이 있으면 기본 포함 검색
+                return modelLower.includes(basemodelLower);
+            }
+        });
+
+        console.log(
+            `기본모델 필터링 완료: ${beforeFilter} -> ${filteredRecords.length}`
+        );
     }
 
-    // 정확한 모델 매칭 (용량이 있는 경우)
-    const availableModels = [...new Set(allRecords.map((r) => r.modelNorm))];
-    const { bestMatch } = stringSimilarity.findBestMatch(
-        searchQuery,
-        availableModels
-    );
+    // 옵션 필터링
+    if (옵션) {
+        filteredRecords = filteredRecords.filter((record) => {
+            const modelLower = record.modelRaw.toLowerCase();
+            const optionLower = 옵션.toLowerCase();
 
-    let matchingRecords = allRecords.filter(
-        (r) => r.modelNorm === bestMatch.target
-    );
+            // 한글 옵션을 영문으로 변환해서 검색
+            if (optionLower === "프로") {
+                return (
+                    modelLower.includes("pro") || modelLower.includes("프로")
+                );
+            } else if (optionLower === "맥스") {
+                return (
+                    modelLower.includes("max") || modelLower.includes("맥스")
+                );
+            } else if (optionLower === "플러스") {
+                return (
+                    modelLower.includes("plus") ||
+                    modelLower.includes("플러스") ||
+                    modelLower.includes("+")
+                );
+            } else if (optionLower === "울트라") {
+                return (
+                    modelLower.includes("ultra") ||
+                    modelLower.includes("울트라")
+                );
+            } else if (optionLower === "엣지") {
+                return (
+                    modelLower.includes("edge") || modelLower.includes("엣지")
+                );
+            } else if (optionLower === "se") {
+                return modelLower.includes("se");
+            } else if (optionLower === "fe") {
+                return modelLower.includes("fe");
+            } else {
+                return modelLower.includes(optionLower);
+            }
+        });
+    }
 
     // 용량 필터링
     if (용량) {
-        matchingRecords = matchingRecords.filter(
-            (r) => r.capacity === 용량 || r.capacity === "기본"
+        console.log(`용량 필터링 시작: ${용량}`);
+        const beforeCapacityFilter = filteredRecords.length;
+
+        // 플립/폴드의 경우 용량 정보 디버깅
+        if (
+            기본모델 &&
+            (기본모델.includes("플립") || 기본모델.includes("폴드"))
+        ) {
+            console.log("플립/폴드 용량 필터링 전 레코드들:");
+            filteredRecords.forEach((record) => {
+                console.log(
+                    `- ${record.modelRaw}: capacity="${record.capacity}"`
+                );
+            });
+        }
+
+        filteredRecords = filteredRecords.filter(
+            (record) => record.capacity === 용량 || record.capacity === "기본"
+        );
+
+        console.log(
+            `용량 필터링 완료: ${beforeCapacityFilter} -> ${filteredRecords.length}`
         );
     }
 
     // 통신사 필터링
     if (통신사) {
-        matchingRecords = matchingRecords.filter((r) => r.telecom === 통신사);
+        filteredRecords = filteredRecords.filter(
+            (record) => record.telecom === 통신사
+        );
     }
 
     // 타입 필터링
     if (타입) {
-        matchingRecords = matchingRecords.filter((r) => r.type === 타입);
+        filteredRecords = filteredRecords.filter(
+            (record) => record.type === 타입
+        );
     }
 
-    return matchingRecords;
+    console.log("검색 결과:", filteredRecords.length, "개");
+    return filteredRecords;
 }
 
-// 개선된 모델 매칭 함수
-function findBestModelMatches(searchQuery, availableModels) {
-    const normalizedQuery = searchQuery.toLowerCase().replace(/\s+/g, "");
-
-    // 1단계: 정확한 매칭 (우선순위 1)
-    const exactMatches = availableModels.filter((modelName) => {
-        const normalizedModel = modelName.toLowerCase().replace(/\s+/g, "");
-        return normalizedModel === normalizedQuery;
-    });
-
-    if (exactMatches.length > 0) {
-        return exactMatches;
-    }
-
-    // 2단계: 스마트 부분 매칭 (우선순위 2)
-    const smartMatches = availableModels.filter((modelName) => {
-        const normalizedModel = modelName.toLowerCase().replace(/\s+/g, "");
-        return isSmartMatch(normalizedQuery, normalizedModel);
-    });
-
-    if (smartMatches.length > 0) {
-        return smartMatches;
-    }
-
-    // 특수 키워드 검사 - 검색어에 특수 키워드가 있는 경우 정확한 매칭만 허용
-    const specialKeywords = [
-        "엣지",
-        "edge",
-        "폴드",
-        "fold",
-        "플립",
-        "flip",
-        "울트라",
-        "ultra",
-        "프로",
-        "pro",
-        "맥스",
-        "max",
-        "플러스",
-        "plus",
-    ];
-
-    const queryHasSpecialKeyword = specialKeywords.some((keyword) =>
-        normalizedQuery.includes(keyword)
-    );
-
-    if (queryHasSpecialKeyword) {
-        // 특수 키워드가 있는 경우 - 정확한 키워드 매칭만 허용
-        console.log("특수 키워드 검색 모드:", normalizedQuery);
-
-        const strictMatches = availableModels.filter((modelName) => {
-            const normalizedModel = modelName.toLowerCase().replace(/\s+/g, "");
-
-            // 검색어의 모든 특수 키워드가 모델명에도 있어야 함
-            const querySpecialKeywords = specialKeywords.filter((keyword) =>
-                normalizedQuery.includes(keyword)
-            );
-
-            const modelHasAllSpecialKeywords = querySpecialKeywords.every(
-                (keyword) => normalizedModel.includes(keyword)
-            );
-
-            if (!modelHasAllSpecialKeywords) {
-                return false;
-            }
-
-            // 기본 모델명 부분도 매칭되는지 확인 (숫자, 브랜드 등)
-            const queryWithoutSpecial = querySpecialKeywords
-                .reduce(
-                    (query, keyword) => query.replace(keyword, ""),
-                    normalizedQuery
-                )
-                .trim();
-
-            const modelWithoutSpecial = querySpecialKeywords
-                .reduce(
-                    (model, keyword) => model.replace(keyword, ""),
-                    normalizedModel
-                )
-                .trim();
-
-            // 기본 부분이 매칭되는지 확인
-            return (
-                queryWithoutSpecial === modelWithoutSpecial ||
-                modelWithoutSpecial.includes(queryWithoutSpecial) ||
-                queryWithoutSpecial.includes(modelWithoutSpecial)
-            );
-        });
-
-        return strictMatches;
-    }
-
-    // 3단계: 일반 부분 매칭 (특수 키워드가 없는 경우만)
-    const partialMatches = availableModels.filter((modelName) => {
-        const normalizedModel = modelName.toLowerCase().replace(/\s+/g, "");
-
-        // 모델명에 특수 키워드가 있으면 제외 (검색어에는 없는데 모델에는 있는 경우)
-        const modelHasSpecialKeyword = specialKeywords.some((keyword) =>
-            normalizedModel.includes(keyword)
-        );
-
-        if (modelHasSpecialKeyword) {
-            return false; // 검색어에 특수 키워드가 없는데 모델에 있으면 제외
-        }
-
-        // 모델명이 검색어보다 길면 제외
-        if (normalizedModel.length > normalizedQuery.length) {
-            return false;
-        }
-
-        // 검색어가 모델명을 포함하는지 확인
-        return normalizedQuery.includes(normalizedModel);
-    });
-
-    // 4단계: 키워드 기반 매칭 (특수 키워드가 없는 경우만)
-    if (partialMatches.length === 0 && !queryHasSpecialKeyword) {
-        const keywordMatches = availableModels.filter((modelName) => {
-            const normalizedModel = modelName.toLowerCase().replace(/\s+/g, "");
-
-            // 모델명에 특수 키워드가 있으면 제외
-            const modelHasSpecialKeyword = specialKeywords.some((keyword) =>
-                normalizedModel.includes(keyword)
-            );
-
-            if (modelHasSpecialKeyword) {
-                return false;
-            }
-
-            // 공통 키워드 추출 (브랜드, 주요 모델명 등)
-            const queryKeywords = extractKeywords(normalizedQuery);
-            const modelKeywords = extractKeywords(normalizedModel);
-
-            // 쿼리의 모든 주요 키워드가 모델에 포함되어야 함
-            return (
-                queryKeywords.length > 0 &&
-                queryKeywords.every((keyword) =>
-                    modelKeywords.some(
-                        (modelKeyword) =>
-                            modelKeyword.includes(keyword) ||
-                            keyword.includes(modelKeyword)
-                    )
-                )
-            );
-        });
-
-        return keywordMatches;
-    }
-
-    return partialMatches;
-}
-
-// 키워드 추출 함수
-function extractKeywords(text) {
-    // 브랜드명, 모델명, 특수 키워드 추출
-    const keywords = [];
-
-    // 브랜드 키워드
-    if (text.includes("갤럭시") || text.includes("galaxy"))
-        keywords.push("갤럭시");
-    if (text.includes("아이폰") || text.includes("iphone"))
-        keywords.push("아이폰");
-
-    // 모델 시리즈
-    const modelNumbers = text.match(/s\d+|iphone\d+|\d+/g) || [];
-    keywords.push(...modelNumbers);
-
-    // 특수 키워드
-    if (text.includes("폴드") || text.includes("fold")) keywords.push("폴드");
-    if (text.includes("플립") || text.includes("flip")) keywords.push("플립");
-    if (text.includes("울트라") || text.includes("ultra"))
-        keywords.push("울트라");
-    if (text.includes("프로") || text.includes("pro")) keywords.push("프로");
-    if (text.includes("맥스") || text.includes("max")) keywords.push("맥스");
-    if (text.includes("플러스") || text.includes("plus"))
-        keywords.push("플러스");
-    if (text.includes("엣지") || text.includes("edge")) keywords.push("엣지");
-
-    return keywords.filter((k) => k.length > 0);
-}
-
-// 개선된 스마트 매칭 함수
-function isSmartMatch(query, modelName) {
-    // 숫자가 포함된 경우 정확한 숫자 매칭 수행
-    const queryNumbers = query.match(/\d+/g) || [];
-    const modelNumbers = modelName.match(/\d+/g) || [];
-
-    if (queryNumbers.length > 0) {
-        // 쿼리에 숫자가 포함된 경우
-
-        // 1. 쿼리의 모든 숫자가 모델명에 정확히 포함되어야 함
-        const allNumbersMatch = queryNumbers.every((queryNum) =>
-            modelNumbers.includes(queryNum)
-        );
-
-        if (!allNumbersMatch) {
-            return false;
-        }
-
-        // 2. 텍스트 부분 매칭 - 더 엄격하게 검사
-        const queryText = query.replace(/\d+/g, "").replace(/\s+/g, "");
-        const modelText = modelName.replace(/\d+/g, "").replace(/\s+/g, "");
-
-        // 특수 키워드가 있는 경우 정확히 매칭되어야 함
-        const specialKeywords = [
-            "엣지",
-            "edge",
-            "폴드",
-            "fold",
-            "플립",
-            "flip",
-            "울트라",
-            "ultra",
-            "프로",
-            "pro",
-            "맥스",
-            "max",
-            "플러스",
-            "plus",
-        ];
-
-        const queryHasSpecial = specialKeywords.some((keyword) =>
-            queryText.includes(keyword)
-        );
-        const modelHasSpecial = specialKeywords.some((keyword) =>
-            modelText.includes(keyword)
-        );
-
-        if (queryHasSpecial && !modelHasSpecial) {
-            return false; // 검색어에 특수 키워드가 있는데 모델에 없으면 매칭 안됨
-        }
-
-        if (!queryHasSpecial && modelHasSpecial) {
-            return false; // 검색어에 특수 키워드가 없는데 모델에 있으면 매칭 안됨
-        }
-
-        // 기본 텍스트 매칭 - 검색어가 모델명을 포함하거나 그 반대
-        return modelText.includes(queryText) || queryText.includes(modelText);
-    } else {
-        // 숫자가 없는 경우 일반 부분 매칭
-        return modelName.toLowerCase().includes(query.toLowerCase());
-    }
-}
-
-// —————— 7) 응답 생성 함수 ——————
+// 응답 생성 함수
 function generateResponse(parsedData, matchingRecords) {
-    const { 브랜드, 모델, 용량, 통신사, 타입, 질문타입, 원본추정 } = parsedData;
-
-    // 5. 비교질문 처리
-    if (질문타입 === "비교질문") {
-        return formatComparisonGuide(parsedData);
-    }
-
-    // 브랜드만 있는 경우 (GPT가 오타포함으로 분류해도 강제로 모델명 검색 실행)
-    if (브랜드 && (!모델 || 모델 === 브랜드)) {
-        if (matchingRecords.length > 0) {
-            return formatSimilarModels(matchingRecords, 브랜드, 모델 || "");
-        }
-    }
-
-    // 모델명만 있는 경우 (브랜드 없이)
-    if (모델 && !브랜드) {
-        if (matchingRecords.length > 0) {
-            return formatSimilarModels(matchingRecords, "", 모델);
-        } else {
-            return `"${모델}" 관련 정보를 찾을 수 없습니다.\n정확한 모델명을 입력해주세요.\n예: 갤럭시 S25, 아이폰 16`;
-        }
-    }
-
-    // 6. 오타/비정형/축약어 포함 질문 처리 (브랜드도 모델도 없는 경우만)
-    if (질문타입 === "오타포함" && !브랜드 && !모델) {
-        return formatTypoGuide(parsedData, 원본추정);
-    }
-
-    if (!브랜드 && !모델) {
-        return "죄송합니다. 모델명을 정확히 파악할 수 없습니다. 다시 말씀해주세요.\n예: 갤럭시 S25 256 SK 번호이동";
-    }
-
-    // 4단계 조건 분석
-    // 1. 모델명만 있는 경우 → 유사 모델명 출력 후 유도
-    if (!용량) {
-        const displayBrand = 브랜드 || "";
-        const displayModel = 모델 || "";
-        return formatSimilarModels(matchingRecords, displayBrand, displayModel);
-    }
-
-    // 2. 모델명 + 용량 → 모든 통신사 조건 표시
-    if (!통신사) {
-        if (matchingRecords.length === 0) {
-            const modelInfo = 브랜드
-                ? `${브랜드} ${모델} ${용량}GB`
-                : `${모델} ${용량}GB`;
-            return `${modelInfo} 정보를 찾을 수 없습니다.\n정확한 모델명과 용량을 확인해주세요.`;
-        }
-        const modelInfo = 브랜드
-            ? `${브랜드} ${모델} ${용량}GB`
-            : `${모델} ${용량}GB`;
-        return formatAllTelecomConditions(matchingRecords, modelInfo);
-    }
-
-    // 3. 모델명 + 용량 + 통신사 → 해당 통신사 조건 표시
-    if (!타입) {
-        if (matchingRecords.length === 0) {
-            const modelInfo = 브랜드
-                ? `${브랜드} ${모델} ${용량}GB ${통신사}`
-                : `${모델} ${용량}GB ${통신사}`;
-            return `${modelInfo} 정보를 찾을 수 없습니다.\n정확한 조건을 확인해주세요.`;
-        }
-        const modelInfo = 브랜드
-            ? `${브랜드} ${모델} ${용량}GB ${통신사}`
-            : `${모델} ${용량}GB ${통신사}`;
-        return formatTelecomSpecificConditions(matchingRecords, modelInfo);
-    }
-
-    // 4. 모델명 + 용량 + 통신사 + 이동유형 → 해당 조건만 표시
     if (matchingRecords.length === 0) {
-        const modelInfo = 브랜드
-            ? `${브랜드} ${모델} ${용량}GB ${통신사} ${타입}`
-            : `${모델} ${용량}GB ${통신사} ${타입}`;
-        return `${modelInfo} 정보를 찾을 수 없습니다.\n정확한 조건을 확인해주세요.`;
+        return "해당 조건의 상품을 찾을 수 없습니다. 다른 조건으로 검색해보세요.";
     }
-    const modelInfo = 브랜드
-        ? `${브랜드} ${모델} ${용량}GB ${통신사} ${타입}`
-        : `${모델} ${용량}GB ${통신사} ${타입}`;
-    return formatSpecificCondition(matchingRecords, modelInfo);
+
+    const { 브랜드, 기본모델, 옵션, 용량, 통신사, 타입 } = parsedData;
+
+    // 용량이 있으면 상세한 가격 정보 출력
+    if (용량) {
+        return generateDetailedResponse(parsedData, matchingRecords);
+    }
+
+    // 용량이 없으면 모델명 목록만 출력
+    const uniqueModels = [...new Set(matchingRecords.map((r) => r.modelRaw))];
+
+    let result = `📱 검색 결과`;
+
+    // 검색 조건 표시
+    if (브랜드 || 기본모델 || 옵션) {
+        let displayText = "";
+
+        // 브랜드와 기본모델을 조합
+        if (브랜드 && 기본모델) {
+            displayText = `${브랜드} ${기본모델}`;
+        } else if (브랜드) {
+            displayText = 브랜드;
+        } else if (기본모델) {
+            // 기본모델을 보고 브랜드 자동 판단
+            if (
+                기본모델.includes("16") ||
+                기본모델.includes("15") ||
+                기본모델.includes("14") ||
+                기본모델.includes("13")
+            ) {
+                displayText = `아이폰 ${기본모델}`;
+            } else {
+                displayText = `갤럭시 ${기본모델}`;
+            }
+        } else if (옵션) {
+            // 옵션만 있을 때
+            displayText = 옵션;
+        }
+
+        // 옵션 추가 (브랜드나 기본모델이 있을 때만)
+        if (옵션 && displayText && displayText !== 옵션) {
+            displayText += ` ${옵션}`;
+        }
+
+        result += ` (${displayText})`;
+    }
+
+    result += ` - ${uniqueModels.length}개 모델:\n\n`;
+
+    uniqueModels.slice(0, 10).forEach((model, index) => {
+        const modelRecords = matchingRecords.filter(
+            (r) => r.modelRaw === model
+        );
+        const capacities = [...new Set(modelRecords.map((r) => r.capacity))];
+
+        result += `${index + 1}. ${model}`;
+        if (capacities.length > 0 && capacities[0] !== "기본") {
+            result += ` (${capacities.join(", ")}GB)`;
+        }
+        result += "\n";
+    });
+
+    if (uniqueModels.length > 10) {
+        result += `\n... 외 ${uniqueModels.length - 10}개 모델`;
+    }
+
+    result += "\n\n💡 자세한 가격을 보려면 용량과 통신사를 함께 말씀해주세요.";
+
+    return result;
 }
 
-// 1. 유사 모델명 포맷 (모델명만 있을 때)
-function formatSimilarModels(records, 브랜드, 모델) {
-    if (records.length === 0) {
-        const searchTerm =
-            브랜드 && 모델 ? `${브랜드} ${모델}` : 브랜드 || 모델 || "";
-        return `${searchTerm} 관련 정보를 찾을 수 없습니다.\n정확한 모델명을 입력해주세요.\n예: 갤럭시 S25, 아이폰 16`;
-    }
+// 상세 가격 정보 생성 함수
+function generateDetailedResponse(parsedData, matchingRecords) {
+    const { 브랜드, 기본모델, 옵션, 용량, 통신사, 타입 } = parsedData;
 
-    // 검색된 모델명들을 브랜드별로 그룹화
-    const uniqueModels = [...new Set(records.map((r) => r.modelRaw))];
-    const galaxyModels = uniqueModels.filter(
-        (m) => m.includes("갤럭시") || m.includes("Galaxy")
-    );
-    const iphoneModels = uniqueModels.filter(
-        (m) => m.includes("아이폰") || m.includes("iPhone")
-    );
+    let result = `💰 가격 정보`;
 
-    // 검색어 표시를 위한 텍스트 생성 - 실제 검색 결과를 분석하여 더 정확한 검색어 표시
-    let searchTerm = "";
-
-    // 검색 결과를 분석하여 공통 키워드 찾기
-    if (galaxyModels.length > 0 && iphoneModels.length === 0) {
-        // 갤럭시만 있는 경우 - 공통 키워드 찾기
-        const commonKeywords = [
-            "폴드",
-            "fold",
-            "플립",
-            "flip",
-            "울트라",
-            "ultra",
-            "플러스",
-            "plus",
-            "S25",
-            "S24",
-            "S23",
-        ];
-        const foundKeyword = commonKeywords.find((keyword) =>
-            galaxyModels.some((model) =>
-                model.toLowerCase().includes(keyword.toLowerCase())
-            )
-        );
-
+    // 검색 조건 표시
+    let displayText = "";
+    if (브랜드 && 기본모델) {
+        displayText = `${브랜드} ${기본모델}`;
+    } else if (브랜드) {
+        displayText = 브랜드;
+    } else if (기본모델) {
+        // 기본모델을 보고 브랜드 자동 판단
         if (
-            foundKeyword &&
-            galaxyModels.every((model) =>
-                model.toLowerCase().includes(foundKeyword.toLowerCase())
-            )
+            기본모델.includes("16") ||
+            기본모델.includes("15") ||
+            기본모델.includes("14") ||
+            기본모델.includes("13")
         ) {
-            // 모든 갤럭시 모델이 공통 키워드를 포함하는 경우
-            searchTerm =
-                foundKeyword.includes("fold") || foundKeyword.includes("폴드")
-                    ? "폴드"
-                    : foundKeyword.includes("flip") ||
-                      foundKeyword.includes("플립")
-                    ? "플립"
-                    : foundKeyword.includes("ultra") ||
-                      foundKeyword.includes("울트라")
-                    ? "울트라"
-                    : foundKeyword.includes("plus") ||
-                      foundKeyword.includes("플러스")
-                    ? "플러스"
-                    : foundKeyword;
+            displayText = `아이폰 ${기본모델}`;
         } else {
-            searchTerm =
-                브랜드 && 모델 && 브랜드 !== 모델
-                    ? `${브랜드} ${모델}`
-                    : 브랜드
-                    ? 브랜드
-                    : 모델 || "갤럭시";
+            displayText = `갤럭시 ${기본모델}`;
         }
-    } else if (iphoneModels.length > 0 && galaxyModels.length === 0) {
-        // 아이폰만 있는 경우 - 공통 키워드 찾기
-        const commonKeywords = [
-            "16",
-            "15",
-            "14",
-            "13",
-            "12",
-            "pro",
-            "프로",
-            "max",
-            "맥스",
-            "plus",
-            "플러스",
-        ];
-        const foundKeyword = commonKeywords.find((keyword) =>
-            iphoneModels.some((model) =>
-                model.toLowerCase().includes(keyword.toLowerCase())
-            )
-        );
-
-        if (
-            foundKeyword &&
-            iphoneModels.every((model) =>
-                model.toLowerCase().includes(foundKeyword.toLowerCase())
-            )
-        ) {
-            // 모든 아이폰 모델이 공통 키워드를 포함하는 경우
-            searchTerm =
-                foundKeyword.includes("pro") || foundKeyword.includes("프로")
-                    ? "프로"
-                    : foundKeyword.includes("max") ||
-                      foundKeyword.includes("맥스")
-                    ? "맥스"
-                    : foundKeyword;
-        } else {
-            searchTerm =
-                브랜드 && 모델 && 브랜드 !== 모델
-                    ? `${브랜드} ${모델}`
-                    : 브랜드
-                    ? 브랜드
-                    : 모델 || "아이폰";
-        }
-    } else {
-        // 혼합되어 있거나 기타 경우
-        searchTerm =
-            브랜드 && 모델 && 브랜드 !== 모델
-                ? `${브랜드} ${모델}`
-                : 브랜드
-                ? 브랜드
-                : 모델 || "";
     }
 
-    let result = `🔍 "${searchTerm}" 검색 결과 (총 ${uniqueModels.length}개 모델):\n\n`;
-
-    // 갤럭시 모델들
-    if (galaxyModels.length > 0) {
-        result += `📱 갤럭시 시리즈\n`;
-        galaxyModels.slice(0, 8).forEach((modelName, index) => {
-            // 해당 모델의 사용 가능한 용량들 찾기
-            const modelRecords = records.filter(
-                (r) => r.modelRaw === modelName
-            );
-            const capacities = [
-                ...new Set(modelRecords.map((r) => r.capacity)),
-            ].filter((c) => c && c !== "기본");
-            const capacityText =
-                capacities.length > 0 ? ` (${capacities.join(", ")}GB)` : "";
-
-            result += `${index + 1}. ${modelName}${capacityText}\n`;
-        });
-        if (galaxyModels.length > 8) {
-            result += `... 외 ${galaxyModels.length - 8}개 모델\n`;
-        }
-        result += `\n`;
+    if (옵션 && displayText && displayText !== 옵션) {
+        displayText += ` ${옵션}`;
+    } else if (옵션) {
+        displayText = 옵션;
     }
 
-    // 아이폰 모델들
-    if (iphoneModels.length > 0) {
-        result += `📱 아이폰 시리즈\n`;
-        iphoneModels.slice(0, 8).forEach((modelName, index) => {
-            // 해당 모델의 사용 가능한 용량들 찾기
-            const modelRecords = records.filter(
-                (r) => r.modelRaw === modelName
-            );
-            const capacities = [
-                ...new Set(modelRecords.map((r) => r.capacity)),
-            ].filter((c) => c && c !== "기본");
-            const capacityText =
-                capacities.length > 0 ? ` (${capacities.join(", ")}GB)` : "";
-
-            result += `${index + 1}. ${modelName}${capacityText}\n`;
-        });
-        if (iphoneModels.length > 8) {
-            result += `... 외 ${iphoneModels.length - 8}개 모델\n`;
-        }
-        result += `\n`;
+    if (용량) {
+        displayText += ` ${용량}GB`;
     }
 
-    result += `💡 정확한 가격을 확인하시려면 용량과 함께 말씀해주세요.\n`;
-    result += `예: "${uniqueModels[0]} 256GB 얼마예요?"`;
+    result += ` - ${displayText}\n\n`;
 
-    return result;
-}
+    // 채널별로 먼저 그룹화 (온라인, 내방)
+    const groupedByChannel = matchingRecords.reduce((acc, record) => {
+        if (!acc[record.channel]) {
+            acc[record.channel] = [];
+        }
+        acc[record.channel].push(record);
+        return acc;
+    }, {});
 
-// 2. 모든 통신사 조건 포맷 (모델명 + 용량)
-function formatAllTelecomConditions(records, modelInfo) {
-    const groupedByTelecom = groupByTelecom(records);
-    let result = `📱 ${modelInfo} 전체 가격 조건을 안내드려요:\n\n`;
+    // 채널별로 출력
+    Object.keys(groupedByChannel).forEach((channel) => {
+        const channelIcon = channel === "온라인" ? "📦" : "🏬";
+        result += `${channelIcon} ${channel} 가격 조건 안내\n\n`;
 
-    // 통신사별로 처리
-    ["SK", "KT", "LG"].forEach((telecom) => {
-        if (groupedByTelecom[telecom]) {
-            // 온라인 조건
-            const onlineRecords = groupedByTelecom[telecom].filter(
-                (r) => r.channel === "온라인"
-            );
-            if (onlineRecords.length > 0) {
-                result += `📦 온라인 가격 조건 안내 (${telecom})\n\n`;
-                result += formatTelecomConditions(onlineRecords);
+        const channelRecords = groupedByChannel[channel];
+
+        // 통신사별로 그룹화
+        const groupedByTelecom = channelRecords.reduce((acc, record) => {
+            if (!acc[record.telecom]) {
+                acc[record.telecom] = [];
             }
+            acc[record.telecom].push(record);
+            return acc;
+        }, {});
 
-            // 내방 조건
-            const offlineRecords = groupedByTelecom[telecom].filter(
-                (r) => r.channel === "내방"
-            );
-            if (offlineRecords.length > 0) {
-                result += `🏬 내방 가격 조건 안내 (${telecom})\n\n`;
-                result += formatTelecomConditions(offlineRecords);
-            }
+        Object.keys(groupedByTelecom).forEach((telecom) => {
+            const telecomRecords = groupedByTelecom[telecom];
 
-            result += `\n`;
-        }
-    });
-
-    return result.trim();
-}
-
-// 3. 특정 통신사 조건 포맷 (모델명 + 용량 + 통신사)
-function formatTelecomSpecificConditions(records, modelInfo) {
-    const telecom = records[0].telecom;
-
-    let result = `📱 ${modelInfo} 조건을 안내드려요:\n\n`;
-
-    // 온라인 조건
-    const onlineRecords = records.filter((r) => r.channel === "온라인");
-    if (onlineRecords.length > 0) {
-        result += `📦 온라인 가격 조건\n\n`;
-        const groupedByType = groupByType(onlineRecords);
-
-        ["번호이동", "기기변경"].forEach((type) => {
-            if (groupedByType[type]) {
-                const record = groupedByType[type][0];
-                result += formatDetailedCondition(record);
-            }
-        });
-    }
-
-    // 내방 조건
-    const offlineRecords = records.filter((r) => r.channel === "내방");
-    if (offlineRecords.length > 0) {
-        result += `🏬 내방 가격 조건\n\n`;
-        const groupedByType = groupByType(offlineRecords);
-
-        ["번호이동", "기기변경"].forEach((type) => {
-            if (groupedByType[type]) {
-                const record = groupedByType[type][0];
-                result += formatDetailedCondition(record);
-            }
-        });
-    }
-
-    return result.trim();
-}
-
-// 4. 특정 조건 포맷 (완전한 조건일 때)
-function formatSpecificCondition(records, modelInfo) {
-    let result = `📱 ${modelInfo} 조건을 안내드려요:\n\n`;
-
-    // 온라인 조건
-    const onlineRecord = records.find((r) => r.channel === "온라인");
-    if (onlineRecord) {
-        result += `📦 온라인 가격 조건\n\n`;
-        result += formatDetailedCondition(onlineRecord);
-    }
-
-    // 내방 조건
-    const offlineRecord = records.find((r) => r.channel === "내방");
-    if (offlineRecord) {
-        result += `🏬 내방 가격 조건\n\n`;
-        result += formatDetailedCondition(offlineRecord);
-    }
-
-    return result;
-}
-
-// 5. 오타/비정형/축약어 포함 질문 유도 응답
-function formatTypoGuide(parsedData, 원본추정) {
-    const { 브랜드, 모델, 용량, 통신사, 타입 } = parsedData;
-
-    let result = `📝 입력해주신 조건을 확인해보니 `;
-
-    // 파악된 정보들 표시
-    const detectedInfo = [];
-    if (브랜드 && 모델) detectedInfo.push(`'${브랜드} ${모델}'`);
-    if (용량) detectedInfo.push(`'${용량}GB'`);
-    if (통신사) detectedInfo.push(`'${통신사}'`);
-    if (타입) detectedInfo.push(`'${타입}'`);
-
-    if (detectedInfo.length > 0) {
-        result += detectedInfo.join(" 또는 ") + " 조건으로 보입니다 😊\n\n";
-    }
-
-    result += `정확한 가격 안내를 위해 아래처럼 말씀해주시면 더 빠르게 안내드릴 수 있어요:\n\n`;
-
-    // 추정되는 정확한 표현 제시
-    if (원본추정) {
-        result += `💡 **추천 검색어:**\n`;
-        result += `"${원본추정}"\n\n`;
-    }
-
-    result += `📋 **입력 형식 예시:**\n`;
-    result += `• 아이폰 16 프로맥스 256 SK 번호이동 얼마예요?\n`;
-    result += `• 갤럭시 S25 울트라 512 KT 기기변경\n`;
-    result += `• 아이폰 15 128 LG 얼마예요?`;
-
-    return result;
-}
-
-// 6. 비교질문 유도 응답
-function formatComparisonGuide(parsedData) {
-    const { 브랜드, 모델, 용량, 통신사, 타입 } = parsedData;
-
-    let result = `🎯 말씀해주신 질문은 가격 비교가 필요한 상황으로 보여요 😊\n\n`;
-    result += `정확한 비교를 위해 아래 정보를 함께 알려주시면 도와드릴게요:\n\n`;
-
-    result += `📌 **필요한 정보:**\n`;
-    result += `• 모델명 + 용량 (예: 아이폰 16 256GB)\n`;
-    result += `• 통신사 (SK/KT/LG)\n`;
-    result += `• 번호이동 or 기기변경\n`;
-    result += `• 온라인 or 내방 희망 여부\n\n`;
-
-    result += `💡 **검색 예시:**\n`;
-    result += `• "아이폰 15 256 LG 번호이동은 얼마예요?"\n`;
-    result += `• "갤럭시 S25 512 SK 기기변경"\n`;
-    result += `• "아이폰 16 프로 128 KT"\n\n`;
-
-    result += `📱 정확한 조건을 입력해주시면 최저가 정보를 찾아드려요!`;
-
-    return result;
-}
-
-// 통신사별 조건 포맷
-function formatTelecomConditions(records) {
-    let result = "";
-    const groupedByType = groupByType(records);
-
-    ["번호이동", "기기변경"].forEach((type) => {
-        if (groupedByType[type]) {
-            const record = groupedByType[type][0];
-            result += formatDetailedCondition(record);
-        }
-    });
-
-    return result;
-}
-
-// 상세 조건 포맷
-function formatDetailedCondition(record) {
-    let result = `📱 ${record.telecom} ${record.type}\n`;
-    result += `✅ 할부원금: ${formatPrice(record.price)}원\n`;
-    result += `✅ 요금제: 월 ${formatPrice(record.plan)}원\n`;
-
-    // 실제 시트의 부가서비스 정보 사용
-    if (record.serviceInfo) {
-        result += `✅ 부가서비스\n`;
-        result += ` - ${record.serviceInfo.serviceName}: ${formatPrice(
-            record.serviceInfo.monthlyFee
-        )}원\n`;
-        result += ` - 유지기간: ${record.serviceInfo.duration}\n`;
-        result += `❗ 미가입 시 추가금: +${formatPrice(
-            record.serviceInfo.additionalFee
-        )}원\n`;
-    }
-
-    result += `\n`;
-    return result;
-}
-
-// 그룹핑 함수들
-function groupByTelecom(records) {
-    const groups = {};
-    records.forEach((record) => {
-        if (!groups[record.telecom]) {
-            groups[record.telecom] = [];
-        }
-        groups[record.telecom].push(record);
-    });
-    return groups;
-}
-
-function groupByType(records) {
-    const groups = {};
-    records.forEach((record) => {
-        if (!groups[record.type]) {
-            groups[record.type] = [];
-        }
-        groups[record.type].push(record);
-    });
-    return groups;
-}
-
-function formatPrice(price) {
-    if (!price || price === "0" || price === "") return "0";
-
-    // 숫자가 아닌 문자열(예: "기종마다 상이")인 경우 그대로 반환
-    if (isNaN(price)) {
-        return price.toString();
-    }
-
-    return parseInt(price).toLocaleString();
-}
-
-// —————— 8) 메인 처리 함수 ——————
-
-// 특수 키워드 처리 함수 (폴드, 플립 등)
-function handleSpecialKeywords(lowerInput, allRecords, keyword) {
-    const englishKeyword = keyword === "폴드" ? "fold" : "flip";
-    console.log(`${keyword} 키워드 발견!`);
-
-    const availableModels = [...new Set(allRecords.map((r) => r.modelRaw))];
-    console.log("전체 모델 수:", availableModels.length);
-
-    const filteredModels = availableModels.filter((modelName) => {
-        const normalizedModel = modelName.toLowerCase().replace(/\s+/g, "");
-        return (
-            normalizedModel.includes(keyword) ||
-            normalizedModel.includes(englishKeyword)
-        );
-    });
-
-    console.log(`${keyword} 모델 수:`, filteredModels.length);
-    console.log(`${keyword} 모델들:`, filteredModels.slice(0, 5));
-
-    if (filteredModels.length === 0) return null;
-
-    // 숫자가 포함된 경우 정확한 매칭
-    const hasNumbers = lowerInput.match(/\d+/g);
-    console.log("모든 숫자:", hasNumbers);
-
-    if (hasNumbers) {
-        // 용량 숫자 제외하고 모델 숫자만 추출
-        const modelNumbers = hasNumbers.filter(
-            (num) => !["64", "128", "256", "512", "1024"].includes(num)
-        );
-        console.log("모델 숫자:", modelNumbers);
-
-        if (modelNumbers.length > 0) {
-            const targetNumber = modelNumbers[0];
-            const exactMatches = filteredModels.filter((modelName) => {
-                const modelNums = modelName.match(/\d+/g) || [];
-                return modelNums.includes(targetNumber);
-            });
-
-            console.log(
-                `${keyword} ${targetNumber} 정확한 매칭:`,
-                exactMatches
-            );
-
-            if (exactMatches.length > 0) {
-                const exactRecords = allRecords.filter((r) =>
-                    exactMatches.includes(r.modelRaw)
-                );
-
-                // 용량이 포함되어 있으면 GPT 파싱으로 계속 진행
-                const hasCapacityInQuery =
-                    lowerInput.includes("256gb") ||
-                    lowerInput.includes("512gb") ||
-                    lowerInput.includes("128gb") ||
-                    lowerInput.includes("64gb") ||
-                    lowerInput.includes("256") ||
-                    lowerInput.includes("512") ||
-                    lowerInput.includes("128") ||
-                    lowerInput.includes("64");
-
-                if (hasCapacityInQuery) {
-                    console.log("용량 포함된 검색 - GPT 파싱으로 계속 진행");
-                    return null; // 계속 진행
-                } else {
-                    return formatSimilarModels(exactRecords, "", keyword);
+            // 타입별로 그룹화
+            const groupedByType = telecomRecords.reduce((acc, record) => {
+                if (!acc[record.type]) {
+                    acc[record.type] = [];
                 }
-            }
-        }
-    }
+                acc[record.type].push(record);
+                return acc;
+            }, {});
 
-    // 숫자가 없는 경우 - 모든 해당 모델 표시
-    if (!hasNumbers || hasNumbers.length === 0) {
-        const filteredRecords = allRecords.filter((r) =>
-            filteredModels.includes(r.modelRaw)
-        );
-        return formatSimilarModels(filteredRecords, "", keyword);
-    }
+            Object.keys(groupedByType).forEach((type) => {
+                const typeRecords = groupedByType[type];
 
-    return null;
+                if (typeRecords.length > 0) {
+                    const record = typeRecords[0];
+
+                    result += `📱 ${telecom} ${type}\n`;
+                    result += `✅ 할부원금: ${parseInt(
+                        record.price
+                    ).toLocaleString()}원\n`;
+                    result += `✅ 요금제: 월 ${parseInt(
+                        record.plan
+                    ).toLocaleString()}원\n`;
+
+                    // 부가서비스 정보가 있는 모든 레코드 찾기
+                    const recordsWithService = typeRecords.filter(
+                        (r) =>
+                            r.serviceInfo &&
+                            Array.isArray(r.serviceInfo) &&
+                            r.serviceInfo.length > 0
+                    );
+
+                    if (recordsWithService.length > 0) {
+                        // 모든 부가서비스 정보 수집
+                        const allServices = [];
+                        recordsWithService.forEach((r) => {
+                            if (r.serviceInfo && Array.isArray(r.serviceInfo)) {
+                                allServices.push(...r.serviceInfo);
+                            }
+                        });
+
+                        // 부가서비스별로 그룹화 (중복 제거)
+                        const uniqueServices = allServices.reduce(
+                            (acc, service) => {
+                                const serviceKey = `${service.serviceName}_${service.monthlyFee}_${service.duration}_${service.additionalFee}`;
+                                if (!acc[serviceKey]) {
+                                    acc[serviceKey] = service;
+                                }
+                                return acc;
+                            },
+                            {}
+                        );
+
+                        const services = Object.values(uniqueServices);
+
+                        if (services.length > 0) {
+                            // 공통 유지기간 찾기
+                            const durations = services
+                                .map((s) => s.duration)
+                                .filter((d) => d && d !== "");
+                            const commonDuration =
+                                durations.length > 0 ? durations[0] : "";
+
+                            result += `✅ 부가서비스`;
+                            if (commonDuration) {
+                                result += ` (${commonDuration} 유지)`;
+                            }
+                            result += `\n`;
+
+                            // 부가서비스 목록 출력
+                            services.forEach((service) => {
+                                result += ` - ${service.serviceName}`;
+
+                                // 월 청구금이 있고 0이 아닌 경우
+                                if (
+                                    service.monthlyFee &&
+                                    service.monthlyFee !== "0" &&
+                                    service.monthlyFee !== ""
+                                ) {
+                                    const fee = parseInt(service.monthlyFee);
+                                    if (fee >= 10000) {
+                                        result += `: ${Math.floor(
+                                            fee / 10000
+                                        )}만`;
+                                        if (fee % 10000 !== 0) {
+                                            result += `${fee % 10000}`;
+                                        }
+                                        result += `원`;
+                                    } else {
+                                        result += `: ${fee.toLocaleString()}원`;
+                                    }
+                                }
+
+                                result += `\n`;
+                            });
+
+                            // 미가입 시 추가금이 있는 서비스들 수집
+                            const servicesWithAdditionalFee = services.filter(
+                                (service) =>
+                                    service.additionalFee &&
+                                    service.additionalFee !== "0" &&
+                                    service.additionalFee !== ""
+                            );
+
+                            if (servicesWithAdditionalFee.length > 0) {
+                                result += `❗ 부가 미가입 시\n`;
+                                servicesWithAdditionalFee.forEach((service) => {
+                                    const fee = parseInt(service.additionalFee);
+                                    let feeText = "";
+                                    if (fee >= 10000) {
+                                        feeText = `+${Math.floor(
+                                            fee / 10000
+                                        )}만`;
+                                        if (fee % 10000 !== 0) {
+                                            feeText += `${fee % 10000}`;
+                                        }
+                                        feeText += `원`;
+                                    } else {
+                                        feeText = `+${fee.toLocaleString()}원`;
+                                    }
+                                    result += ` - ${service.serviceName} 미가입: ${feeText}\n`;
+                                });
+                            }
+                        }
+                    }
+
+                    result += `\n`;
+                }
+            });
+        });
+
+        result += `\n`;
+    });
+
+    return result;
 }
 
+// 메인 함수
 async function processUserQuery(userInput, openaiApiKey) {
     try {
-        // 시트 데이터 가져오기
+        console.log("사용자 입력:", userInput);
+
+        // 1. 시트 데이터 가져오기
         const { allRecords } = await parseFullSheetStructure(
             spreadsheetId.value()
         );
+        console.log("총 레코드 수:", allRecords.length);
 
-        // 1. 특정 모델명 키워드 우선 처리 (GPT 파싱보다 먼저)
-        const lowerInput = userInput.toLowerCase();
-        console.log("=== 키워드 검색 시작 ===");
-        console.log("입력된 검색어:", userInput);
-        console.log("소문자 변환:", lowerInput);
-
-        // 폴드 키워드 처리
-        if (lowerInput.includes("폴드") || lowerInput.includes("fold")) {
-            const result = handleSpecialKeywords(
-                lowerInput,
-                allRecords,
-                "폴드"
-            );
-            if (result) return result;
+        // 2. GPT로 입력 파싱
+        const parsedData = await parseUserInput(userInput, openaiApiKey);
+        if (!parsedData) {
+            return "질문을 이해할 수 없습니다. 다시 말씀해주세요.";
         }
 
-        // 플립 키워드 처리
-        if (lowerInput.includes("플립") || lowerInput.includes("flip")) {
-            const result = handleSpecialKeywords(
-                lowerInput,
-                allRecords,
-                "플립"
-            );
-            if (result) return result;
-        }
+        // 3. 검색 실행
+        const matchingRecords = findMatchingRecords(parsedData, allRecords);
 
-        const hasCapacity =
-            lowerInput.includes("256") ||
-            lowerInput.includes("128") ||
-            lowerInput.includes("512") ||
-            lowerInput.includes("1tb") ||
-            lowerInput.includes("64") ||
-            lowerInput.includes("32");
-
-        const specificKeywords = [
-            { keyword: "울트라", english: "ultra" },
-            { keyword: "프로", english: "pro" },
-            { keyword: "맥스", english: "max" },
-            { keyword: "플러스", english: "plus" },
-        ];
-
-        // 특정 키워드가 있는지 확인 - 용량이 없는 경우 우선 처리
-        const foundSpecificKeyword = specificKeywords.find(
-            (item) =>
-                lowerInput.includes(item.keyword) ||
-                lowerInput.includes(item.english)
+        // 디버깅: 검색된 레코드 중 부가서비스가 있는 레코드들 출력
+        const recordsWithServices = matchingRecords.filter(
+            (r) =>
+                r.serviceInfo &&
+                Array.isArray(r.serviceInfo) &&
+                r.serviceInfo.length > 0
         );
-
-        console.log("기타 키워드 검색 조건 확인:", {
-            foundSpecificKeyword: foundSpecificKeyword,
-            hasCapacity: hasCapacity,
+        console.log("=== 검색된 레코드 중 부가서비스가 있는 레코드들 ===");
+        recordsWithServices.forEach((r) => {
+            console.log(
+                `${r.telecom} ${r.channel} ${r.type} - ${
+                    r.modelRaw
+                }: ${r.serviceInfo.map((s) => s.serviceName).join(", ")}`
+            );
         });
 
-        if (foundSpecificKeyword && !hasCapacity) {
-            console.log("특정 키워드 발견:", foundSpecificKeyword);
-            console.log("용량 포함여부:", hasCapacity);
-
-            const availableModels = [
-                ...new Set(allRecords.map((r) => r.modelRaw)),
-            ];
-
-            console.log("전체 모델 수:", availableModels.length);
-            console.log("샘플 모델명들:", availableModels.slice(0, 10));
-
-            // 숫자가 포함된 경우 더 정확한 매칭 수행
-            const hasNumbers = lowerInput.match(/\d+/g);
-            let keywordMatches;
-
-            if (hasNumbers && !hasCapacity) {
-                console.log("숫자가 포함된 키워드 검색:", hasNumbers);
-                // 숫자가 포함된 경우 - 개선된 검색 알고리즘 사용
-                const searchQuery = userInput.toLowerCase().replace(/\s+/g, "");
-                keywordMatches = findBestModelMatches(
-                    searchQuery,
-                    availableModels
-                );
-            } else {
-                console.log("일반 키워드 검색 실행");
-                // 숫자가 없는 경우 - 일반 키워드 검색
-                keywordMatches = availableModels.filter((modelName) => {
-                    const normalizedModel = modelName
-                        .toLowerCase()
-                        .replace(/\s+/g, "");
-                    return (
-                        normalizedModel.includes(
-                            foundSpecificKeyword.keyword
-                        ) ||
-                        normalizedModel.includes(foundSpecificKeyword.english)
-                    );
-                });
-            }
-
-            console.log("키워드로 매칭된 모델 수:", keywordMatches.length);
-            console.log(
-                "키워드로 매칭된 모델명들:",
-                keywordMatches.slice(0, 5)
-            );
-
-            const keywordRecords = allRecords.filter((r) =>
-                keywordMatches.includes(r.modelRaw)
-            );
-
-            if (keywordRecords.length > 0) {
-                console.log(
-                    "특정 키워드 검색 성공:",
-                    keywordRecords.length + "개 모델 발견"
-                );
-                return formatSimilarModels(
-                    keywordRecords,
-                    "",
-                    foundSpecificKeyword.keyword
-                );
-            } else {
-                console.log("키워드 검색 결과 없음");
-            }
-        }
-
-        // 2. GPT로 사용자 입력 파싱
-        const parsedData = await parseUserInput(userInput, openaiApiKey);
-        console.log("GPT 파싱 결과:", JSON.stringify(parsedData));
-
-        if (!parsedData) {
-            return "죄송합니다. 질문을 이해할 수 없습니다. 다시 말씀해주세요.";
-        }
-
-        // 3. 매칭되는 레코드 찾기
-        const matchingRecords = findMatchingRecords(parsedData, allRecords);
-        console.log("매칭된 레코드 수:", matchingRecords.length);
-
-        // 4. 브랜드 키워드가 있는 경우 직접 검색 (GPT 파싱 실패 시 또는 용량이 없을 때)
-        const hasGalaxy =
-            lowerInput.includes("갤럭시") || lowerInput.includes("galaxy");
-        const hasIphone =
-            lowerInput.includes("아이폰") || lowerInput.includes("iphone");
-
-        // GPT 파싱에서 브랜드+모델이 모두 있는 경우, 매칭 레코드가 있으면 우선 사용
-        if (
-            parsedData.브랜드 &&
-            parsedData.모델 &&
-            parsedData.브랜드 !== parsedData.모델 &&
-            matchingRecords.length > 0
-        ) {
-            console.log(
-                "GPT 파싱 결과로 브랜드+모델 조합 검색 성공:",
-                matchingRecords.length + "개 모델 발견"
-            );
-            const response = generateResponse(parsedData, matchingRecords);
-            return response;
-        }
-
-        // 브랜드가 있고 용량이 없으며, GPT 파싱에서 모델이 제대로 설정되지 않은 경우에만 직접 검색
-        if (
-            (hasGalaxy || hasIphone) &&
-            !hasCapacity &&
-            !foundSpecificKeyword &&
-            (!parsedData.브랜드 ||
-                !parsedData.모델 ||
-                parsedData.브랜드 === parsedData.모델 ||
-                matchingRecords.length === 0)
-        ) {
-            console.log("브랜드 키워드 발견, 직접 검색 실행:", {
-                hasGalaxy,
-                hasIphone,
-                hasCapacity,
-            });
-
-            const brandName = hasGalaxy ? "갤럭시" : "아이폰";
-            const availableModels = [
-                ...new Set(allRecords.map((r) => r.modelRaw)),
-            ];
-
-            // 브랜드 키워드로 직접 검색
-            const directMatches = availableModels.filter((modelName) => {
-                return modelName
-                    .toLowerCase()
-                    .includes(brandName.toLowerCase());
-            });
-
-            console.log("매칭된 모델명들:", directMatches.slice(0, 5));
-
-            const directRecords = allRecords.filter((r) =>
-                directMatches.includes(r.modelRaw)
-            );
-
-            if (directRecords.length > 0) {
-                console.log(
-                    "직접 브랜드 검색 성공:",
-                    directRecords.length + "개 모델 발견"
-                );
-                return formatSimilarModels(directRecords, brandName, "");
-            }
-        }
-
-        // 5. 모델명 키워드만 있는 경우 직접 검색 (브랜드 없이 모델명만 입력한 경우)
-        if (
-            !hasGalaxy &&
-            !hasIphone &&
-            !hasCapacity &&
-            !foundSpecificKeyword &&
-            matchingRecords.length === 0
-        ) {
-            console.log("모델명 키워드로 직접 검색 시도");
-
-            // 일반적인 모델명 키워드들
-            const modelKeywords = [
-                "s25",
-                "s24",
-                "s23",
-                "s22",
-                "s21",
-                "s20",
-                "16",
-                "15",
-                "14",
-                "13",
-                "12",
-                "11",
-                "아이패드",
-                "ipad",
-                "워치",
-                "watch",
-            ];
-
-            // 입력에서 모델명 키워드 찾기
-            const foundKeywords = modelKeywords.filter((keyword) =>
-                lowerInput.includes(keyword)
-            );
-
-            if (foundKeywords.length > 0) {
-                console.log("발견된 모델명 키워드들:", foundKeywords);
-
-                const availableModels = [
-                    ...new Set(allRecords.map((r) => r.modelRaw)),
-                ];
-
-                // 발견된 키워드들로 모델 검색
-                const directMatches = availableModels.filter((modelName) => {
-                    const normalizedModel = modelName
-                        .toLowerCase()
-                        .replace(/\s+/g, "");
-                    return foundKeywords.some((keyword) =>
-                        normalizedModel.includes(keyword.replace(/\s+/g, ""))
-                    );
-                });
-
-                console.log(
-                    "키워드로 매칭된 모델명들:",
-                    directMatches.slice(0, 5)
-                );
-
-                const directRecords = allRecords.filter((r) =>
-                    directMatches.includes(r.modelRaw)
-                );
-
-                if (directRecords.length > 0) {
-                    console.log(
-                        "직접 모델명 키워드 검색 성공:",
-                        directRecords.length + "개 모델 발견"
-                    );
-                    return formatSimilarModels(
-                        directRecords,
-                        "",
-                        foundKeywords.join(" ")
-                    );
-                }
-            }
-        }
-
-        // 6. 응답 생성
-        const response = generateResponse(parsedData, matchingRecords);
-
-        return response;
+        // 4. 응답 생성
+        return generateResponse(parsedData, matchingRecords);
     } catch (error) {
         console.error("처리 중 오류:", error);
-        return "죄송합니다. 서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.";
+        return "죄송합니다. 처리 중 오류가 발생했습니다.";
     }
 }
 
-// —————— 9) Firebase Functions 엔드포인트 ——————
-export const phonePrice = onRequest(
-    {
-        invoker: "public",
-        cors: true,
-        secrets: [openaiApiKey],
-    },
-    async (req, res) => {
-        try {
-            res.set("Access-Control-Allow-Origin", "*");
-            res.set("Access-Control-Allow-Methods", "GET, POST");
-            res.set("Access-Control-Allow-Headers", "Content-Type");
-
-            if (req.method === "OPTIONS") {
-                res.status(204).send("");
-                return;
-            }
-
-            const question =
-                req.method === "GET" ? req.query.question : req.body?.question;
-
-            if (!question) {
-                res.status(400).json({
-                    error: "질문이 필요합니다.",
-                    usage: 'GET: ?question=질문내용 또는 POST: {"question": "질문내용"}',
-                });
-                return;
-            }
-
-            const response = await processUserQuery(
-                question,
-                openaiApiKey.value()
-            );
-
-            res.json({
-                question: question,
-                answer: response,
-            });
-        } catch (error) {
-            console.error("Error details:", error);
-            res.status(500).json({
-                error: "서버 오류가 발생했습니다.",
-                message: error.message,
-            });
-        }
-    }
-);
-
-// —————— 10) 카카오톡 챗봇 스킬 엔드포인트 ——————
+// Firebase Functions
 export const kakaoSkill = onRequest(
     {
-        invoker: "public",
-        cors: true,
         secrets: [openaiApiKey],
+        cors: true,
     },
     async (req, res) => {
         try {
-            res.set("Access-Control-Allow-Origin", "*");
-            res.set("Access-Control-Allow-Methods", "POST");
-            res.set("Access-Control-Allow-Headers", "Content-Type");
+            const userInput = req.body?.userRequest?.utterance;
 
-            if (req.method === "OPTIONS") {
-                res.status(204).send("");
-                return;
-            }
-
-            const { userRequest } = req.body;
-
-            if (!userRequest || !userRequest.utterance) {
+            if (!userInput) {
                 return res.status(400).json({
                     version: "2.0",
                     template: {
@@ -1514,9 +815,8 @@ export const kakaoSkill = onRequest(
                 });
             }
 
-            const question = userRequest.utterance;
-            const answer = await processUserQuery(
-                question,
+            const response = await processUserQuery(
+                userInput,
                 openaiApiKey.value()
             );
 
@@ -1526,21 +826,21 @@ export const kakaoSkill = onRequest(
                     outputs: [
                         {
                             simpleText: {
-                                text: answer,
+                                text: response,
                             },
                         },
                     ],
                 },
             });
         } catch (error) {
-            console.error("카카오톡 스킬 오류:", error);
-            res.json({
+            console.error("KakaoSkill Error:", error);
+            res.status(500).json({
                 version: "2.0",
                 template: {
                     outputs: [
                         {
                             simpleText: {
-                                text: "죄송합니다. 서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+                                text: "서비스에 문제가 발생했습니다. 잠시 후 다시 시도해주세요.",
                             },
                         },
                     ],
@@ -1550,5 +850,35 @@ export const kakaoSkill = onRequest(
     }
 );
 
-// Firebase Functions v2 전용 - CLI 테스트 코드 제거
-// 로컬 테스트는 Firebase Emulator를 사용하세요: firebase emulators:start --only functions
+export const phonePrice = onRequest(
+    {
+        secrets: [openaiApiKey],
+        cors: true,
+    },
+    async (req, res) => {
+        try {
+            const userInput = req.body?.query || req.query?.q;
+
+            if (!userInput) {
+                return res.status(400).json({
+                    error: "질문을 입력해주세요.",
+                });
+            }
+
+            const response = await processUserQuery(
+                userInput,
+                openaiApiKey.value()
+            );
+
+            res.json({
+                query: userInput,
+                response: response,
+            });
+        } catch (error) {
+            console.error("PhonePrice Error:", error);
+            res.status(500).json({
+                error: "서비스에 문제가 발생했습니다.",
+            });
+        }
+    }
+);
