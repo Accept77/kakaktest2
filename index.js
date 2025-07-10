@@ -791,7 +791,7 @@ async function processUserQuery(userInput, openaiApiKey) {
             브랜드 || 기본모델 || 옵션 || 용량 || 통신사 || 타입;
 
         if (!hasValidData) {
-            return '죄송합니다. 다음의 정보들을 포함해서 질문해주세요!\n📌 모델명 + 용량\n📌 통신사 (SK/KT/LG)\n📌 번호이동 or 기기변경\n📌 온라인 or 내방 희망 여부\n\n예시: "아이폰 15 256 LG 번호이동은 얼마예요?"\n"갤럭시 S25 256 얼마에요"';
+            return '📌 필요한 정보:\n• 모델명 + 용량 (예: 아이폰 16 256GB)\n• 통신사 (SK/KT/LG)\n• 번호이동 or 기기변경\n• 온라인 or 내방 희망 여부\n\n💡 검색 예시:\n• "아이폰 15 256 LG 번호이동은 얼마예요?"\n• "갤럭시 S25 512 SK 기기변경"\n• "아이폰 16 프로 128 KT"';
         }
 
         // 4. 검색 실행
