@@ -560,7 +560,8 @@ function generateResponse(parsedData, matchingRecords) {
         result += `\n... 외 ${uniqueModels.length - 10}개 모델`;
     }
 
-    result += "\n\n💡 자세한 가격을 보려면 용량과 통신사를 함께 말씀해주세요.";
+    result +=
+        "\n\n💡 자세한 가격을 보려면 용량과 통신사를 함께 말씀해주세요. \n\n예시: '아이폰 15 256 LG 번호이동 가격'\n'갤럭시 S25 256GB SK 기기변경 가격'";
 
     return result;
 }
@@ -784,7 +785,16 @@ async function processUserQuery(userInput, openaiApiKey) {
             return "질문을 이해할 수 없습니다. 다시 말씀해주세요.";
         }
 
-        // 3. 검색 실행
+        // 3. 파싱 결과 검증 - 모든 필드가 비어있는지 확인
+        const { 브랜드, 기본모델, 옵션, 용량, 통신사, 타입 } = parsedData;
+        const hasValidData =
+            브랜드 || 기본모델 || 옵션 || 용량 || 통신사 || 타입;
+
+        if (!hasValidData) {
+            return '죄송합니다. 다음의 정보들을 포함해서 질문해주세요!\n📌 모델명 + 용량\n📌 통신사 (SK/KT/LG)\n📌 번호이동 or 기기변경\n📌 온라인 or 내방 희망 여부\n\n예시: "아이폰 15 256 LG 번호이동은 얼마예요?"\n"갤럭시 S25 256 얼마에요"';
+        }
+
+        // 4. 검색 실행
         const matchingRecords = findMatchingRecords(parsedData, allRecords);
 
         // 디버깅: 검색된 레코드 중 부가서비스가 있는 레코드들 출력
@@ -803,7 +813,7 @@ async function processUserQuery(userInput, openaiApiKey) {
             );
         });
 
-        // 4. 응답 생성
+        // 5. 응답 생성
         return generateResponse(parsedData, matchingRecords);
     } catch (error) {
         console.error("처리 중 오류:", error);
